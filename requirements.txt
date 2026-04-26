@@ -1,0 +1,9 @@
+# Batch 1 基础依赖。后续 batch 会按需追加：
+#   Batch 2: 无新增（标准库 sqlite3 / asyncio）+ fastapi（看板）
+#   Batch 3: pytest, deepeval, jinja2, litellm
+#   Batch 4: dashscope, pyncm, bilibili-api-python, browser-use
+#   Batch 5: pipecat-ai, langgraph, langchain
+#   Batch 6: picamera2, sherpa-onnx, openwakeword, insightface, onnxruntime
+#   Batch 7: qrcode, lark-oapi
+pydantic>=2.5
+PyYAML>=6.0

@@ -1,0 +1,92 @@
+# LiteLLM Router Configuration Template
+# User fills in API keys and model preferences
+
+# Primary LLM providers for main agent (chat role)
+main:
+  # Model used for main conversation turns
+  model: "gpt-4-turbo"
+
+  # Fallback chain if primary fails
+  fallbacks:
+    - "claude-3-opus-20240229"
+    - "gpt-3.5-turbo"
+
+  # Timeout per request (seconds)
+  timeout: 30
+
+  # Retry strategy
+  max_retries: 3
+
+# Cheap LLM for memory consolidation (dream role)
+cheap:
+  model: "gpt-3.5-turbo"
+
+  fallbacks:
+    - "claude-3-haiku-20240307"
+
+  timeout: 15
+  max_retries: 2
+
+# Judge models for evaluation (5 different providers)
+judges:
+  - name: "gpt4"
+    model: "gpt-4-turbo"
+    timeout: 30
+
+  - name: "claude3"
+    model: "claude-3-opus-20240229"
+    timeout: 30
+
+  - name: "gemini"
+    model: "gemini-2.0-flash"
+    timeout: 30
+
+  - name: "mixtral"
+    model: "mixtral-8x7b-instruct-v0.1"
+    timeout: 30
+
+  - name: "gpt35"
+    model: "gpt-3.5-turbo"
+    timeout: 20
+
+# API Keys - User must fill these in
+# Store in backend/secrets/llm_keys.env and load via python-dotenv
+api_keys:
+  openai: "${OPENAI_API_KEY}"
+  anthropic: "${ANTHROPIC_API_KEY}"
+  google: "${GOOGLE_API_KEY}"
+  replicate: "${REPLICATE_API_KEY}"
+  cohere: "${COHERE_API_KEY}"
+
+# Cost tracking
+cost_tracking:
+  enabled: true
+  budget_per_day: 50.0  # USD
+
+# Token limits per request
+token_limits:
+  main:
+    max_input: 8000
+    max_output: 2000
+
+  cheap:
+    max_input: 4000
+    max_output: 1000
+
+  judge:
+    max_input: 6000
+    max_output: 1000
+
+# Temperature and other parameters
+parameters:
+  main:
+    temperature: 0.7
+    top_p: 0.9
+
+  cheap:
+    temperature: 0.5
+    top_p: 0.9
+
+  judge:
+    temperature: 0.2
+    top_p: 0.9
