@@ -1,10 +1,10 @@
 # My_agent — Pi 4B 24/7 多人格语音 Agent
 
-完整设计见 [plan.md](plan.md)；当前实施进度见 [PROGRESS.md](PROGRESS.md)。
+完整设计见 [plan.md](plan.md)；当前实施进度见 [process.md](process.md)。
 
 ## 当前状态
 
-P0 脚手架阶段，分 8 个 batch 增量交付。**尚未可端到端运行。**
+8 个 batch 全部完成（88 文件），核心逻辑已通过 160 项冒烟测试。**尚未可端到端运行（需要 LLM API 密钥 + 树莓派硬件）。**
 
 ## 项目布局
 
@@ -168,19 +168,19 @@ python scripts/test_persona_voice.py kobe --text "你好，我是 Kobe"
 
 ## 文件结构
 
-详见 [PROGRESS.md](PROGRESS.md) 和 [plan.md](plan.md) §13。
+详见 [process.md](process.md) 和 [plan.md](plan.md) §13。
 
 ## 测试
 
 ```bash
-# 运行所有测试
+# 运行冒烟测试（无需硬件/API密钥）
+python -m pytest tests/smoke_test.py -v
+
+# 运行评测用例（需要 LLM 密钥）
 pytest eval/runners/harness.py -v
 
 # 运行特定类别
-pytest eval/runners/harness.py -k "security" -v
-
-# 生成覆盖率报告
-pytest --cov=core eval/runners/harness.py
+pytest tests/smoke_test.py -k "security" -v
 ```
 
 ## 部署

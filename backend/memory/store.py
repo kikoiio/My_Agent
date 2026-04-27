@@ -104,9 +104,25 @@ class MemoryStore:
                     content,
                     event_type,
                     metadata_json,
-                    content_id=id,
+                    content_rowid=id,
                     content=episodes
                 );
+
+                -- Triggers to keep FTS5 index in sync with episodes
+                CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
+                    INSERT INTO episodes_fts(rowid, content, event_type, metadata_json)
+                    VALUES (new.id, new.content, new.event_type, new.metadata_json);
+                END;
+                CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
+                    INSERT INTO episodes_fts(episodes_fts, rowid, content, event_type, metadata_json)
+                    VALUES ('delete', old.id, old.content, old.event_type, old.metadata_json);
+                END;
+                CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
+                    INSERT INTO episodes_fts(episodes_fts, rowid, content, event_type, metadata_json)
+                    VALUES ('delete', old.id, old.content, old.event_type, old.metadata_json);
+                    INSERT INTO episodes_fts(rowid, content, event_type, metadata_json)
+                    VALUES (new.id, new.content, new.event_type, new.metadata_json);
+                END;
 
                 -- L3: Dreams (consolidated patterns)
                 CREATE TABLE IF NOT EXISTS dreams (
@@ -226,7 +242,7 @@ class MemoryStore:
                     FROM episodes e
                     WHERE e.user_id=? AND e.persona=?
                     AND e.id IN (
-                        SELECT content_id FROM episodes_fts
+                        SELECT rowid FROM episodes_fts
                         WHERE episodes_fts MATCH ?
                     )
                     ORDER BY e.timestamp DESC

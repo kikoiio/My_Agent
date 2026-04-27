@@ -79,13 +79,15 @@ async def agent_loop(
         )
     )
 
-    # Determine routing
-    routed_role = route(ctx.state.role, user_message, image_bytes is not None)
+    # Update state with new message and image flag
     updated_state = ctx.state
-    updated_state.role = routed_role
     updated_state.messages = new_messages
     updated_state.has_image = image_bytes is not None
     updated_state.trace_id = trace_id
+
+    # Determine routing
+    routed_role = route(user_message, updated_state)
+    updated_state.role = routed_role
 
     # Get system prompt from persona
     system_prompt = ctx.persona.system_prompt
