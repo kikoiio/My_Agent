@@ -11,7 +11,7 @@ import yaml
 class Persona:
     name: str
     system_prompt: str
-    voice_ref_path: Path
+    voice_ref_path: Path | None
     voice_ref_text: str
     wake_model_path: Path | None
     tools_allowed: list[str] = field(default_factory=list)
@@ -33,6 +33,7 @@ def load(persona_dir: Path) -> Persona:
     system_prompt = sp_path.read_text(encoding="utf-8")
 
     voice_ref = persona_dir / "voice_ref.wav"
+    voice_ref_path = voice_ref if voice_ref.exists() else None
     vr_txt = persona_dir / "voice_ref.txt"
     voice_ref_text = vr_txt.read_text(encoding="utf-8").strip() if vr_txt.exists() else ""
 
@@ -54,7 +55,7 @@ def load(persona_dir: Path) -> Persona:
     return Persona(
         name=name,
         system_prompt=system_prompt,
-        voice_ref_path=voice_ref,
+        voice_ref_path=voice_ref_path,
         voice_ref_text=voice_ref_text,
         wake_model_path=wake if wake.exists() else None,
         tools_allowed=list(tools_data.get("allowed") or []),

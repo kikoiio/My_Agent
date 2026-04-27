@@ -1,9 +1,60 @@
-# Batch 1 基础依赖。后续 batch 会按需追加：
-#   Batch 2: 无新增（标准库 sqlite3 / asyncio）+ fastapi（看板）
-#   Batch 3: pytest, deepeval, jinja2, litellm
-#   Batch 4: dashscope, pyncm, bilibili-api-python, browser-use
-#   Batch 5: pipecat-ai, langgraph, langchain
-#   Batch 6: picamera2, sherpa-onnx, openwakeword, insightface, onnxruntime
-#   Batch 7: qrcode, lark-oapi
+# =============================================================================
+# Multi-Persona Voice Agent — Dependencies
+# =============================================================================
+# 安装: pip install -r requirements.txt
+#
+# 注意：Pi 边缘端依赖（picamera2, openwakeword, insightface 等）仅在
+# Raspberry Pi 4B 上安装，见文件末尾的 [edge] 分组。
+# =============================================================================
+
+# ---- 核心（必装） ----
 pydantic>=2.5
 PyYAML>=6.0
+python-dotenv>=1.0
+
+# ---- Web 服务 & 通信 ----
+fastapi>=0.109
+uvicorn[standard]>=0.27
+websockets>=12.0
+aiohttp>=3.9
+
+# ---- LLM 路由 ----
+litellm>=1.30
+openai>=1.12
+anthropic>=0.28
+
+# ---- LangGraph 编排 ----
+langgraph>=0.0.40
+langchain>=0.1
+langchain-core>=0.1
+
+# ---- 评估 & 测试 ----
+pytest>=8.0
+pytest-asyncio>=0.23
+jinja2>=3.1
+
+# ---- TTS（服务端调用） ----
+dashscope>=1.17
+
+# ---- MCP 服务 ----
+# bilibili-api-python  # 取消注释安装
+# pyncm               # 取消注释安装
+caldav>=1.3
+# browser-use          # 取消注释安装
+
+# ---- 可选：Mem0 集成 ----
+# mem0ai              # 取消注释安装
+
+# ---- [edge] Pi 边缘端依赖（仅在 Raspberry Pi 4B 上安装） ----
+# picamera2
+# sherpa-onnx
+# openwakeword
+# insightface
+# onnxruntime
+# sounddevice
+# pipewire-python
+
+# ---- [optional] 自托管服务 ----
+# pipecat-ai          # 可选：Pipecat 音频管线框架
+# qrcode>=7.4         # 可选：QR 登录码生成
+# lark-oapi>=1.3      # 可选：飞书通知

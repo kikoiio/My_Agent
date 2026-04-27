@@ -236,6 +236,7 @@ VOICE_ENROLLMENT_DIR=data/enrollments/voices
 - 2026-04-27: Created `tests/smoke_test.py` — 160 tests, all passing.
 - 2026-04-27: Fixed 3 bugs found during testing (FTS5 content_id, route() args, FTS5 triggers).
 - 2026-04-27: Consolidated PROGRESS.md, IMPLEMENTATION_SUMMARY.md, DELIVERABLES.txt, QUICK_REFERENCE.md into this single `process.md`.
+- 2026-04-27: P0 Spike — Created `backend/litellm/client.py` (LLM callable factory), `main.py` (CLI entry point), fixed `persona.py` (optional voice_ref), fixed `tracer.py` (trace_list_recent signature). Agent now runs end-to-end with real LLM via aihubmix.
 
 ## 10. Next Steps / Roadmap
 
@@ -243,11 +244,11 @@ Priority-ordered:
 
 1. [x] ~~Install Python 3.10+ and pip dependencies~~ (done)
 2. [x] ~~Run smoke tests and verify core logic~~ (160/160 passing)
-3. [ ] Add `is_healthy()` and `trip(reason)` methods to `CircuitBreaker`
-4. [ ] Create `backend/secrets/llm_keys.env` with real API keys
-5. [ ] Configure `backend/litellm/router.yaml` with model endpoints
-6. [ ] Create at least one real persona (e.g., `personas/kobe/`)
-7. [ ] Wire up real `llm_call` in agent loop using litellm
+3. [x] ~~Add `is_healthy()` and `trip(reason)` methods to `CircuitBreaker`~~ (done — methods already existed, stale tests updated)
+4. [x] ~~Create `backend/secrets/llm_keys.env` with real API keys~~ (done)
+5. [x] ~~Configure `backend/litellm/router.yaml` with model endpoints~~ (done — aihubmix + NVIDIA models)
+6. [x] ~~Create at least one real persona~~ (done — `personas/assistant/` with system_prompt, tools, routing, memory_init)
+7. [x] ~~Wire up real `llm_call` in agent loop using litellm~~ (done — `backend/litellm/client.py` + `main.py` CLI)
 8. [ ] Acquire Raspberry Pi 4B + USB camera + mic + BT speaker
 9. [ ] Run `deploy/check_hardware.sh` on Pi
 10. [ ] Install Pi drivers (picamera2, sherpa-onnx, openwakeword, etc.)
@@ -258,6 +259,27 @@ Priority-ordered:
 15. [ ] Obtain service credentials (Bilibili, Netease, Bocha, CalDAV)
 16. [ ] Deploy backend with Docker Compose
 17. [ ] Start edge runtime on Pi
+
+### New additions (2026-04-27)
+
+- `backend/litellm/client.py` — LiteLLM callable factory, loads router.yaml, resolves env vars, provides `create_llm_callable()`
+- `main.py` — CLI entry point: `python main.py [--persona assistant]`
+- `core/persona.py` — `voice_ref_path` now `Path | None` (optional for text-only chat)
+- `backend/observe/tracer.py` — `trace_list_recent()` parameters made optional (fixes dashboard call)
+- `tests/smoke_test.py` — Updated `TestKnownIssues` → `TestCircuitBreakerIntegration` (methods now exist)
+
+### Quick start
+
+```bash
+# Interactive chat
+python main.py
+
+# With a specific persona
+python main.py --persona assistant
+
+# Run all tests
+python -m pytest tests/smoke_test.py -v
+```
 
 ## Appendix: Deleted Documents
 

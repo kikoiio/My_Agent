@@ -1,0 +1,18 @@
+# 该人格可见的工具白名单 / 黑名单。
+# allowed 支持 glob：`pyncm-music.*` 等于该 MCP server 下全部工具。
+# require_speaker_verify 内的工具调用前必须再做一次主人声纹验证。
+
+allowed:
+  - search.*
+  - calendar.*
+  - memory.read
+  - memory.search
+
+denied:
+  - shell.*
+  - bilibili.post_dynamic
+  - bilibili.send_dm
+
+require_speaker_verify:
+  - memory.delete
+  - shell.exec

@@ -96,7 +96,7 @@ async def save_credential(credential: dict[str, str]) -> bool:
 async def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description="Bilibili QR login")
-    parser.add_argument("--timeout", type=int, default=60, help="QR scan timeout (seconds)")
+    parser.add_argument("--timeout", type=int, default=120, help="QR scan timeout (seconds)")
 
     args = parser.parse_args()
 
@@ -108,12 +108,23 @@ async def main():
         logger.error("Failed to get QR code")
         return False
 
-    logger.info(f"Scan this QR code: {qr_info['qrcode_url']}")
+    print(f"\n{'='*50}")
+    print(f"  Bilibili QR Login")
+    print(f"  QR URL: {qr_info['qrcode_url']}")
+    print(f"  Timeout: {args.timeout}s")
+    print(f"  Press Ctrl+C to cancel")
+    print(f"{'='*50}\n")
+    _print_qr_terminal(qr_info["qrcode_url"])
 
     # Wait for scan
-    credential = await wait_for_scan(qr_info["qrcode_key"], timeout_s=args.timeout)
+    try:
+        credential = await wait_for_scan(qr_info["qrcode_key"], timeout_s=args.timeout)
+    except KeyboardInterrupt:
+        logger.info("Login cancelled by user")
+        return False
+
     if not credential:
-        logger.error("QR code scan failed or timed out")
+        logger.error("QR code scan failed or timed out — please try again")
         return False
 
     # Save credential
@@ -124,6 +135,20 @@ async def main():
         logger.error("Failed to save credential")
 
     return success
+
+
+def _print_qr_terminal(url: str) -> None:
+    """Print QR code in terminal if qrcode package is available."""
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(url)
+        qr.make(fit=True)
+        qr.print_ascii()
+    except ImportError:
+        print("(Install qrcode package for terminal QR: pip install qrcode)")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

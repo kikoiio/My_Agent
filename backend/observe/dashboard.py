@@ -10,7 +10,14 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-__all__ = ["DashboardApp"]
+try:
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
+
+__all__ = ["DashboardApp", "create_dashboard_html"]
 
 
 def create_dashboard_html(
@@ -303,26 +310,69 @@ class DashboardApp:
 
     def render_html(self) -> str:
         """Render dashboard HTML with current data."""
-        # Gather data
-        traces_data = []
-        memory_stats = {}
-        rate_limit_status = {}
-
-        if self.tracer:
-            # Sample recent traces (from all personas)
-            # In real usage, this would query recent traces from tracer
-            traces_data = []
-
-        if self.memory_store:
-            # Memory stats placeholder
-            memory_stats = {"sessions": 0, "episodes": 0, "dreams": 0}
+        traces_data = self._gather_traces()
+        memory_stats = self._gather_memory_stats()
+        rate_limit_status = self._gather_rate_limit_status()
 
         now = datetime.now(timezone.utc).isoformat()
         return create_dashboard_html(traces_data, memory_stats, rate_limit_status).replace(
             "{{now}}", now
         )
 
-    # When integrated with FastAPI, this would be used like:
-    # @app.get("/dashboard")
-    # def get_dashboard():
-    #     return HTMLResponse(dashboard.render_html())
+    def _gather_traces(self) -> list[dict[str, Any]]:
+        """Gather recent trace data from tracer."""
+        if not self.tracer:
+            return []
+        try:
+            traces = self.tracer.trace_list_recent(limit=20)
+            return [
+                {
+                    "trace_id": t.trace_id,
+                    "persona": t.persona,
+                    "role": t.role,
+                    "output_tokens": t.output_tokens,
+                    "error": t.error,
+                    "timestamp": t.timestamp,
+                }
+                for t in traces
+            ]
+        except Exception:
+            return []
+
+    def _gather_memory_stats(self) -> dict[str, Any]:
+        """Gather memory statistics from memory store."""
+        if not self.memory_store:
+            return {"sessions": 0, "episodes": 0, "dreams": 0}
+        try:
+            return {
+                "sessions": getattr(self.memory_store, "session_count", lambda: 0)(),
+                "episodes": getattr(self.memory_store, "episode_count", lambda: 0)(),
+                "dreams": getattr(self.memory_store, "dream_count", lambda: 0)(),
+            }
+        except Exception:
+            return {"sessions": 0, "episodes": 0, "dreams": 0}
+
+    def _gather_rate_limit_status(self) -> dict[str, Any]:
+        """Gather rate limit status from tracer."""
+        if not self.tracer:
+            return {"limited_count": 0}
+        try:
+            import time
+            now = time.time()
+            keys = ["bilibili_dynamic", "bilibili_dm", "ncm"]
+            limited = 0
+            for key in keys:
+                count = self.tracer.ratelimit_get_count(key, now - 86400)
+                if count >= getattr(self.tracer, "max_per_day", 9999):
+                    limited += 1
+            return {"limited_count": limited}
+        except Exception:
+            return {"limited_count": 0}
+
+    def mount(self, app: FastAPI, path: str = "/dashboard") -> None:
+        """Mount dashboard route onto a FastAPI app."""
+        dashboard = self
+
+        @app.get(path, response_class=HTMLResponse)
+        def get_dashboard():
+            return dashboard.render_html()

@@ -10,6 +10,9 @@ memory:
   db_path: ./data/memory.db
   l1_token_budget: 12000
   l2_use_fts5: true
+  sqlite:
+    wal_mode: true
+    busy_timeout: 5000
   dream:
     idle_minutes: 30
     pending_threshold: 20
@@ -45,6 +48,9 @@ tracer:
   db_path: ./data/traces.db
   events_retention_days: 90
   dashboard_bind: 127.0.0.1:8080
+  sqlite:
+    wal_mode: true
+    busy_timeout: 5000
 
 # LLM 路由别名 → 具体模型映射见 backend/litellm/router.yaml
 # Pipecat / nanobot 各有独立 yaml

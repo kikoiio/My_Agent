@@ -1,92 +1,104 @@
-# LiteLLM Router Configuration Template
-# User fills in API keys and model preferences
+# LiteLLM Router Configuration
+# 用户自行填写模型名和 API Key
+# 提供商：aihubmix.com (国内直连) / build.nvidia.com (国内直连)
+#
+# AIHubMix:  https://aihubmix.com/v1
+# NVIDIA:    https://integrate.api.nvidia.com/v1
 
-# Primary LLM providers for main agent (chat role)
-main:
-  # Model used for main conversation turns
-  model: "gpt-4-turbo"
+model_list:
+  # 日常对话
+  - model_name: default_fast
+    litellm_params:
+      model: coding-glm-5.1-free
+      api_base: https://aihubmix.com/v1
+      api_key: ${AIHUBMIX_API_KEY}
+    max_input: 8000
+    max_output: 2000
+    temperature: 0.7
 
-  # Fallback chain if primary fails
-  fallbacks:
-    - "claude-3-opus-20240229"
-    - "gpt-3.5-turbo"
+  # 复杂任务（强推理）
+  - model_name: default_smart
+    litellm_params:
+      model: coding-glm-5.1-free
+      api_base: https://aihubmix.com/v1
+      api_key: ${AIHUBMIX_API_KEY}
+    max_input: 8000
+    max_output: 2000
+    temperature: 0.7
 
-  # Timeout per request (seconds)
-  timeout: 30
+  # 记忆整理（便宜模型即可）
+  - model_name: cheap
+    litellm_params:
+      model: kimi-for-coding-free
+      api_base: https://aihubmix.com/v1
+      api_key: ${AIHUBMIX_API_KEY}
+    max_input: 4000
+    max_output: 1000
+    temperature: 0.5
 
-  # Retry strategy
-  max_retries: 3
+  # 多模态（视觉）
+  - model_name: vision
+    litellm_params:
+      model: gemini-3.1-flash-image-preview-free
+      api_base: https://aihubmix.com/v1
+      api_key: ${AIHUBMIX_API_KEY}
 
-# Cheap LLM for memory consolidation (dream role)
-cheap:
-  model: "gpt-3.5-turbo"
+  # 长上下文
+  - model_name: long_context
+    litellm_params:
+      model: coding-glm-5.1-free
+      api_base: https://aihubmix.com/v1
+      api_key: ${AIHUBMIX_API_KEY}
 
-  fallbacks:
-    - "claude-3-haiku-20240307"
+  # Judge 评估（建议用不同模型，如有多个提供商）
+  - model_name: judge_1
+    litellm_params:
+      model: deepseek-ai/deepseek-v4-pro
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: ${NVIDIA_API_KEY}
 
-  timeout: 15
-  max_retries: 2
+  - model_name: judge_2
+    litellm_params:
+      model: moonshotai/kimi-k2-thinking
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: ${NVIDIA_API_KEY}
 
-# Judge models for evaluation (5 different providers)
-judges:
-  - name: "gpt4"
-    model: "gpt-4-turbo"
-    timeout: 30
+  - model_name: judge_3
+    litellm_params:
+      model: coding-minimax-m2.7-free
+      api_base: https://aihubmix.com/v1
+      api_key: ${AIHUBMIX_API_KEY}
 
-  - name: "claude3"
-    model: "claude-3-opus-20240229"
-    timeout: 30
-
-  - name: "gemini"
-    model: "gemini-2.0-flash"
-    timeout: 30
-
-  - name: "mixtral"
-    model: "mixtral-8x7b-instruct-v0.1"
-    timeout: 30
-
-  - name: "gpt35"
-    model: "gpt-3.5-turbo"
-    timeout: 20
-
-# API Keys - User must fill these in
-# Store in backend/secrets/llm_keys.env and load via python-dotenv
+# API Keys
 api_keys:
-  openai: "${OPENAI_API_KEY}"
-  anthropic: "${ANTHROPIC_API_KEY}"
-  google: "${GOOGLE_API_KEY}"
-  replicate: "${REPLICATE_API_KEY}"
-  cohere: "${COHERE_API_KEY}"
+  aihubmix: "${AIHUBMIX_API_KEY}"
+  nvidia: "${NVIDIA_API_KEY}"
 
 # Cost tracking
 cost_tracking:
   enabled: true
-  budget_per_day: 50.0  # USD
+  budget_per_day: 5.0  # 人民币
 
-# Token limits per request
+# Token limits
 token_limits:
   main:
     max_input: 8000
     max_output: 2000
-
   cheap:
     max_input: 4000
     max_output: 1000
-
   judge:
     max_input: 6000
     max_output: 1000
 
-# Temperature and other parameters
+# Parameters
 parameters:
   main:
     temperature: 0.7
     top_p: 0.9
-
   cheap:
     temperature: 0.5
     top_p: 0.9
-
   judge:
     temperature: 0.2
     top_p: 0.9

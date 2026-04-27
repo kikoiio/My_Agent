@@ -122,4 +122,7 @@ authentication:
   bilibili: "${BILIBILI_CREDENTIAL_FILE}"
   pyncm: "${NCM_CREDENTIAL_FILE}"
   bocha_search: "${BOCHA_API_KEY}"
-  caldav: "${CALDAV_URL}"
+  caldav:
+    url: "${CALDAV_URL}"
+    username: "${CALDAV_USERNAME}"
+    password: "${CALDAV_PASSWORD}"

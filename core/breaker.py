@@ -22,6 +22,13 @@ class CircuitBreaker:
     max_steps: int = 15
     seen: set[str] = field(default_factory=set)
     steps: int = 0
+    trip_reason: str | None = None
+
+    def is_healthy(self) -> bool:
+        return self.trip_reason is None
+
+    def trip(self, reason: str) -> None:
+        self.trip_reason = reason
 
     def check(self, tool_name: str, args: dict[str, Any]) -> None:
         self.steps += 1

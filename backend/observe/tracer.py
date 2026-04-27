@@ -170,6 +170,9 @@ class Tracer:
         """Get thread-safe DB connection."""
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     # ============ Trace Methods ============
@@ -241,34 +244,36 @@ class Tracer:
 
     def trace_list_recent(
         self,
-        persona: str,
-        user_id: str,
+        persona: str | None = None,
+        user_id: str | None = None,
         limit: int = 100,
         role: str | None = None,
     ) -> list[Trace]:
-        """List recent traces for a persona/user."""
+        """List recent traces, optionally filtered by persona/user/role."""
         with self._lock:
             with self._get_connection() as conn:
-                if role:
-                    rows = conn.execute(
-                        """
-                        SELECT * FROM traces
-                        WHERE persona=? AND user_id=? AND role=?
-                        ORDER BY timestamp DESC
-                        LIMIT ?
-                        """,
-                        (persona, user_id, role, limit),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """
-                        SELECT * FROM traces
-                        WHERE persona=? AND user_id=?
-                        ORDER BY timestamp DESC
-                        LIMIT ?
-                        """,
-                        (persona, user_id, limit),
-                    ).fetchall()
+                conditions: list[str] = []
+                params: list[str | int] = []
+
+                if persona is not None:
+                    conditions.append("persona=?")
+                    params.append(persona)
+                if user_id is not None:
+                    conditions.append("user_id=?")
+                    params.append(user_id)
+                if role is not None:
+                    conditions.append("role=?")
+                    params.append(role)
+
+                where = ""
+                if conditions:
+                    where = "WHERE " + " AND ".join(conditions)
+
+                params.append(limit)
+                rows = conn.execute(
+                    f"SELECT * FROM traces {where} ORDER BY timestamp DESC LIMIT ?",
+                    tuple(params),
+                ).fetchall()
 
                 return [
                     Trace(

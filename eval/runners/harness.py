@@ -9,6 +9,7 @@ Per plan.md §8.2-8.4:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -186,15 +187,19 @@ class EvaluationHarness:
 def run_eval(
     cases_dir: str = "eval/cases",
     category: str | None = None,
+    agent_func: Any = None,
+    jury: Any = None,
 ) -> dict[str, Any]:
-    """Standalone eval runner (pytest entry point).
+    """Standalone eval runner.
 
     Args:
         cases_dir: Path to cases directory
         category: Optional category filter
+        agent_func: Optional async agent function (persona, input_text) -> (response, _, trace_id)
+        jury: Optional JudgeEnsemble instance
 
     Returns:
-        Summary dict
+        Summary dict with results
     """
     harness = EvaluationHarness(cases_dir=cases_dir)
     cases = harness.load_cases(category=category)
@@ -207,11 +212,148 @@ def run_eval(
             "error": "No test cases found",
         }
 
+    # If agent and jury are available, run real evaluation
+    if agent_func and jury:
+        return _run_with_async(harness, cases, agent_func, jury)
+
+    # Fallback: load cases only, mark as pending (not failed)
     return {
         "total": len(cases),
         "passed": 0,
-        "failed": len(cases),
+        "failed": 0,
+        "pending": len(cases),
         "cases_loaded": [c.get("id") for c in cases],
+        "message": "Provide agent_func and jury to run real evaluation",
+    }
+
+
+def _run_with_async(
+    harness: EvaluationHarness,
+    cases: list[dict[str, Any]],
+    agent_func: Any,
+    jury: Any,
+) -> dict[str, Any]:
+    """Bridge sync->async for running evaluation."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None:
+        import concurrent.futures
+        import threading
+
+        result_container = {}
+        error_container = {}
+
+        def run_in_thread():
+            try:
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                result_container["result"] = new_loop.run_until_complete(
+                    _run_cases_async(harness, cases, agent_func, jury)
+                )
+            except Exception as e:
+                error_container["error"] = e
+            finally:
+                new_loop.close()
+
+        thread = threading.Thread(target=run_in_thread, daemon=True)
+        thread.start()
+        thread.join()
+
+        if "error" in error_container:
+            raise error_container["error"]
+        return result_container.get("result", {})
+
+    return asyncio.run(_run_cases_async(harness, cases, agent_func, jury))
+
+
+async def _run_cases_async(
+    harness: EvaluationHarness,
+    cases: list[dict[str, Any]],
+    agent_func: Any,
+    jury: Any,
+) -> dict[str, Any]:
+    """Execute all cases through agent + jury."""
+    passed = 0
+    failed = 0
+    results = []
+
+    for case in cases:
+        try:
+            input_text = ""
+            expected = ""
+            persona = "default"
+
+            # Extract from turns format
+            turns = case.get("turns", [])
+            for turn in turns:
+                if turn.get("role") == "user":
+                    input_text = turn.get("content", "")
+                    break
+            # Fallback to direct fields
+            if not input_text:
+                input_text = case.get("input", "")
+            expected = case.get("expected", "")
+
+            try:
+                response, _, trace_id = await agent_func(persona, input_text)
+            except Exception:
+                response = f"[Agent error for case {case.get('id', 'unknown')}]"
+                trace_id = "error"
+
+            # Evaluate with jury
+            try:
+                verdict = await jury.evaluate(
+                    trace_id=trace_id,
+                    input_text=input_text,
+                    output_text=response,
+                    expected=expected,
+                )
+                is_pass = verdict.final_verdict == "pass"
+            except Exception:
+                is_pass = False
+                verdict = None
+
+            result = {
+                "case_id": case.get("id", "unknown"),
+                "category": case.get("category", "unknown"),
+                "input": input_text,
+                "output": response,
+                "expected": expected,
+                "trace_id": trace_id,
+                "jury_score": verdict.final_score if verdict else 0.0,
+                "jury_verdict": verdict.final_verdict if verdict else "error",
+                "confidence": verdict.confidence if verdict else 0.0,
+                "passed": is_pass,
+            }
+
+            if is_pass:
+                passed += 1
+            else:
+                failed += 1
+
+            results.append(result)
+            harness.results.append(result)
+
+        except Exception as e:
+            logger.error(f"Case {case.get('id', 'unknown')} failed: {e}")
+            failed += 1
+            harness.results.append(
+                {
+                    "case_id": case.get("id", "unknown"),
+                    "category": case.get("category", "unknown"),
+                    "error": str(e),
+                    "passed": False,
+                }
+            )
+
+    return {
+        "total": len(cases),
+        "passed": passed,
+        "failed": failed,
+        "results": results,
     }
 
 
@@ -233,9 +375,39 @@ def harness():
     return EvaluationHarness()
 
 
-# Dummy test to satisfy pytest (can be run with `pytest eval/runners/harness.py`)
+def test_eval_case(eval_case: dict[str, Any]) -> None:
+    """Run a single YAML test case against the evaluation framework.
+
+    Loads the case, extracts input, and verifies case structure is valid.
+    When agent and jury are wired in, this will execute full evaluation.
+    """
+    case_id = eval_case.get("id", "unknown")
+    category = eval_case.get("category", "unknown")
+    assertions = eval_case.get("assertions", [])
+
+    # Validate case structure
+    assert case_id, "Case must have an id"
+    assert category, "Case must have a category"
+
+    # Check for any valid input format (turns, input, mock_external_input, setup)
+    has_input = bool(
+        eval_case.get("turns")
+        or eval_case.get("input")
+        or eval_case.get("mock_external_input")
+        or eval_case.get("setup")
+    )
+    assert has_input, f"Case {case_id} must have turns, input, mock_external_input, or setup"
+
+    # Validate assertions have required fields
+    for a in assertions:
+        assert a.get("type"), f"Case {case_id}: assertion must have a type"
+        if a["type"] == "llm_judge":
+            assert a.get("criteria"), f"Case {case_id}: llm_judge requires criteria"
+            assert a.get("threshold"), f"Case {case_id}: llm_judge requires threshold"
+
+
 def test_harness_initialization():
     """Test that harness initializes correctly."""
-    harness = EvaluationHarness()
-    assert harness.cases_dir.name == "cases"
-    assert harness.judges_dir.name == "judges"
+    harness_obj = EvaluationHarness()
+    assert harness_obj.cases_dir.name == "cases"
+    assert harness_obj.judges_dir.name == "judges"

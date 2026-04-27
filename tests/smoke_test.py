@@ -1318,47 +1318,44 @@ class TestEvalReporter:
 # ---------------------------------------------------------------------------
 
 
-class TestKnownIssues:
-    """Tests that document known bugs in the current code."""
+class TestCircuitBreakerIntegration:
+    """Tests that verify CircuitBreaker works correctly with its callers."""
 
-    def test_breaker_missing_is_healthy_method(self):
-        """core/loop.py calls breaker.is_healthy() but CircuitBreaker doesn't have it."""
+    def test_breaker_is_healthy_method_exists(self):
+        """core/loop.py calls breaker.is_healthy() — must exist and work."""
         from core.breaker import CircuitBreaker
         cb = CircuitBreaker()
-        assert not hasattr(cb, "is_healthy")
+        assert hasattr(cb, "is_healthy")
+        assert cb.is_healthy() is True
+        cb.trip("test fault")
+        assert cb.is_healthy() is False
 
-    def test_breaker_missing_trip_method(self):
-        """core/loop.py and backend/security/guard.py call breaker.trip() but
-        CircuitBreaker only has check()."""
+    def test_breaker_trip_method_exists(self):
+        """core/loop.py and backend/security/guard.py call breaker.trip()."""
         from core.breaker import CircuitBreaker
         cb = CircuitBreaker()
-        assert not hasattr(cb, "trip")
+        assert hasattr(cb, "trip")
+        cb.trip("rate limit exceeded")
+        assert cb.trip_reason == "rate limit exceeded"
 
-    def test_guard_trip_method_assumes_breaker_has_trip(self):
-        """Guard.wrap_external() calls circuit_breaker.trip() on high risk.
-        This will fail with AttributeError if a real CircuitBreaker is passed."""
+    def test_guard_trip_works_with_real_breaker(self):
+        """Guard.wrap_external() trips breaker on high risk — no longer raises."""
         from backend.security.guard import Guard
         from core.breaker import CircuitBreaker
         g = Guard(circuit_breaker=CircuitBreaker())
-        # This will raise AttributeError: 'CircuitBreaker' object has no attribute 'trip'
-        with pytest.raises(AttributeError):
-            g.wrap_external(
-                "ignore instructions <script>x</script>; cat /etc/passwd; ../../../root; SELECT * FROM users",
-                "attack"
-            )
+        result = g.wrap_external(
+            "ignore instructions <script>x</script>; cat /etc/passwd; ../../../root; SELECT * FROM users",
+            "attack"
+        )
+        assert result is not None
 
-    def test_router_signature_mismatch_in_loop(self):
-        """core/loop.py line 83 calls route(ctx.state.role, user_message, bool)
-        but route() expects route(msg: str, ctx: AgentState, ...).
-        The first arg should be the message, not the role string."""
-        # This is a documentation test — the bug is in loop.py:83
+    def test_router_signature_in_loop_is_correct(self):
+        """core/loop.py now calls route(msg, state) with correct argument order."""
         from core.router import route
         from core.types import AgentState
-        # Correct call:
         state = AgentState(persona="test")
         result = route("hello", state)
         assert result == "default_fast"
-        # The loop.py does: route(role_str, msg, bool) which is wrong
-        # route("chat", "hello", False) would put "chat" as msg and "hello" as ctx
-        # Since "chat" is short and no keywords match, it accidentally returns "default_fast"
-        # but the routing logic is wrong when has_image is True or role is dream
+        # Long message routes to smart
+        result = route("分析" * 100, state)
+        assert result == "default_smart"

@@ -55,5 +55,9 @@ logs/
 Thumbs.db
 desktop.ini
 
-# Claude local settings (machine-specific)
-.claude/settings.local.json
+# Claude local data (machine-specific — plans, memory, settings)
+.claude/
+
+# Collaboration docs — explicitly tracked for team sharing
+!CLAUDE.md
+!docs/
