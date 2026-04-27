@@ -31,11 +31,13 @@ data/
 *.sqlite3
 
 # Secrets / env files
-backend/secrets/
+backend/secrets/*
+!backend/secrets/*.env.example
 *.env
 .env
 .env.*
 !*.env.example
+.json
 
 # Persona binary assets (large / user-specific)
 personas/*/voice_ref.wav

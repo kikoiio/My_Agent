@@ -1314,6 +1314,93 @@ class TestEvalReporter:
 
 
 # ---------------------------------------------------------------------------
+# MCP servers — credential loading (bilibili / pyncm)
+# ---------------------------------------------------------------------------
+
+
+class TestBilibiliServer:
+    """BilibiliServer credential file loading & graceful degradation."""
+
+    def test_no_credential_returns_empty(self):
+        from backend.mcp_servers.bilibili import BilibiliServer
+        srv = BilibiliServer(credential_file=None)
+        assert srv.authenticated is False
+        # Unauthenticated → all read tools return empty, send returns False
+        result = asyncio.run(srv.get_live_chat(123, limit=5))
+        assert result == []
+        assert asyncio.run(srv.send_message(123, "hi")) is False
+
+    def test_loads_credential_file(self, tmp_path, monkeypatch):
+        from backend.mcp_servers.bilibili import BilibiliServer
+
+        cred_path = tmp_path / "bilibili_credential.json"
+        cred_path.write_text(json.dumps({
+            "sessdata": "fake_sess",
+            "bili_jct": "fake_jct",
+            "buvid3": "fake_buvid",
+            "dedeuserid": "12345",
+        }), encoding="utf-8")
+
+        # Stub bilibili_api.Credential so test doesn't need the real package
+        import sys as _sys
+        import types as _types
+        fake_module = _types.ModuleType("bilibili_api")
+        fake_module.Credential = lambda **kw: dict(kw)  # type: ignore
+        monkeypatch.setitem(_sys.modules, "bilibili_api", fake_module)
+
+        srv = BilibiliServer(credential_file=str(cred_path))
+        assert srv.authenticated is True
+        assert srv._credential == {
+            "sessdata": "fake_sess",
+            "bili_jct": "fake_jct",
+            "buvid3": "fake_buvid",
+            "dedeuserid": "12345",
+        }
+
+
+class TestPyncmServer:
+    """PyncmServer credential file loading & graceful degradation."""
+
+    def test_no_credential_returns_empty(self):
+        from backend.mcp_servers.pyncm import PyncmServer
+        srv = PyncmServer(credential_file=None)
+        assert srv.authenticated is False
+        assert asyncio.run(srv.search_track("foo", limit=3)) == []
+        assert asyncio.run(srv.get_playlist(1)) == {}
+
+    def test_loads_credential_file(self, tmp_path, monkeypatch):
+        from backend.mcp_servers.pyncm import PyncmServer
+
+        cred_path = tmp_path / "pyncm_credential.json"
+        cred_path.write_text(json.dumps({
+            "login_info": {"content": {"profile": {"userId": 999, "nickname": "tester"}}},
+            "cookies": {},
+        }), encoding="utf-8")
+
+        # Stub pyncm so test doesn't need the real package
+        import sys as _sys
+        import types as _types
+        calls: dict = {}
+
+        class _StubSession:
+            def load(self, data):
+                calls["loaded"] = data
+
+        def _set(sess):
+            calls["set"] = sess
+
+        fake_module = _types.ModuleType("pyncm")
+        fake_module.Session = _StubSession  # type: ignore
+        fake_module.SetCurrentSession = _set  # type: ignore
+        monkeypatch.setitem(_sys.modules, "pyncm", fake_module)
+
+        srv = PyncmServer(credential_file=str(cred_path))
+        assert srv.authenticated is True
+        assert isinstance(calls["set"], _StubSession)
+        assert "login_info" in calls["loaded"]
+
+
+# ---------------------------------------------------------------------------
 # Discovered bugs / known issues
 # ---------------------------------------------------------------------------
 
