@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -119,6 +120,87 @@ def create_llm_callable(role: str = "default_fast") -> Callable[[str, str, Perso
         return response.choices[0].message.content or ""
 
     return llm_call
+
+
+def create_llm_callable_with_tools(
+    role: str = "default_fast",
+) -> Callable[..., dict]:
+    """Tool-aware variant of `create_llm_callable`.
+
+    Returns a callable with signature::
+
+        llm_call_with_tools(
+            messages: list[dict],         # OpenAI message dicts
+            tools: list[dict] | None,     # OpenAI tool schemas
+            tool_choice: str = "auto",
+            persona: Persona | None = None,
+        ) -> {"content": str, "tool_calls": list[dict]}
+
+    Each `tool_calls` entry is `{"id": str, "name": str, "arguments": dict}`.
+    `tools=None` falls through to a plain completion (still returns the dict
+    shape with empty `tool_calls`).
+    """
+    model_map = _build_model_map()
+    cfg = model_map.get(role, model_map.get("default_fast", {}))
+    if not cfg:
+        raise ValueError(f"No model config found for role '{role}'")
+
+    model_name = cfg["model"]
+    api_base = cfg["api_base"]
+    api_key = cfg["api_key"]
+    temperature = cfg["temperature"]
+
+    if api_base and "nvidia" in api_base.lower():
+        litellm_model = f"nvidia/{model_name}"
+    elif api_base and "aihubmix" in api_base.lower():
+        litellm_model = f"openai/{model_name}"
+    else:
+        litellm_model = model_name
+
+    def llm_call_with_tools(
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+        persona: Persona | None = None,
+    ) -> dict:
+        import litellm
+
+        kwargs: dict[str, Any] = dict(
+            model=litellm_model,
+            messages=messages,
+            api_base=api_base,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=cfg["max_output"],
+            timeout=30,
+        )
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        response = litellm.completion(**kwargs)
+        msg = response.choices[0].message
+
+        content = (getattr(msg, "content", None) or "")
+        raw_tool_calls = getattr(msg, "tool_calls", None) or []
+        parsed_calls = []
+        for tc in raw_tool_calls:
+            fn = getattr(tc, "function", None) or {}
+            fn_name = getattr(fn, "name", None) if not isinstance(fn, dict) else fn.get("name")
+            raw_args = getattr(fn, "arguments", None) if not isinstance(fn, dict) else fn.get("arguments")
+            try:
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except json.JSONDecodeError:
+                parsed_args = {}
+            parsed_calls.append({
+                "id": getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else "") or "",
+                "name": fn_name or "",
+                "arguments": parsed_args,
+            })
+
+        return {"content": content, "tool_calls": parsed_calls}
+
+    return llm_call_with_tools
 
 
 def get_llm_callable_for_route(routed_role: str) -> Callable[[str, str, Persona], str]:

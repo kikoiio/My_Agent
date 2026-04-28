@@ -2,7 +2,7 @@
 
 ## Overview
 
-Voice-enabled AI agent platform with multiple personas. Runs 24/7 on Raspberry Pi 4B (edge: wake word, face/voice biometrics, STT/TTS) with a backend server (LLM routing via LiteLLM, 3-tier SQLite memory, LangGraph orchestration, security guard, observability). Edge and backend communicate over WireGuard VPN. 88 files, 160 smoke tests passing.
+Voice-enabled AI agent platform with multiple personas. Runs 24/7 on Raspberry Pi 4B (edge: wake word, face/voice biometrics, STT/TTS) with a backend server (LLM routing via LiteLLM, 3-tier SQLite memory, LangGraph orchestration, tool calling, security guard, observability). Edge and backend communicate over WireGuard VPN. 89 files, 176 smoke tests passing. Tool calling against real AIHubMix verified end-to-end (2026-04-27).
 
 ## Quick Start
 
@@ -51,7 +51,7 @@ edge/ (Raspberry Pi)          backend/ (Server)
 | `core/` | Shared types, persona loading, router, circuit breaker, HAL | `types.py`, `persona.py`, `router.py`, `breaker.py` |
 | `backend/litellm/` | LLM client factory, model routing config | `client.py`, `router.yaml` |
 | `backend/memory/` | 3-tier SQLite memory (L1/L2/L3) | `store.py`, `dream.py` |
-| `backend/orchestrator/` | LangGraph reasoning pipeline | `graph.py` |
+| `backend/orchestrator/` | LangGraph reasoning pipeline + tool calling | `graph.py`, `tools.py` |
 | `backend/security/` | Injection guard, rate limiting | `guard.py`, `ratelimit.py` |
 | `backend/observe/` | Distributed tracing, dashboard | `tracer.py`, `dashboard.py` |
 | `backend/mcp_servers/` | 7 MCP tool implementations | `caldav.py`, `bilibili.py`, `memory.py`, etc. |
@@ -60,7 +60,7 @@ edge/ (Raspberry Pi)          backend/ (Server)
 | `personas/` | Persona definitions (5 files each) | `_template/`, `assistant/` |
 | `eval/` | YAML test cases, harness, reporter | `cases/`, `runners/harness.py` |
 | `deploy/` | Docker Compose, systemd, WireGuard | `docker-compose.yml` |
-| `tests/` | 160 smoke tests (4 tiers) | `smoke_test.py` |
+| `tests/` | 176 smoke tests (4 tiers) | `smoke_test.py` |
 
 ## Key Conventions
 

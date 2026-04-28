@@ -36,7 +36,7 @@ All 8 batches complete (88 files). Code architecture and logic are sound — cor
 
 ## 3. Smoke Test Results
 
-**160 tests, 160 passed** — run on 2026-04-27 with Python 3.10.0, pydantic 2.12.5, pytest 9.0.3.
+**176 tests, 176 passed** — last run 2026-04-27 (after roadmap 7b real-LLM smoke + critic fix). Initial 160-test baseline established the same day on Python 3.10.0, pydantic 2.12.5, pytest 9.0.3; +16 added with the tool-calling work (9 ToolRegistry + 3 ToolCallingFlow + 4 MCP-server stubs + 2 graph regressions repaired).
 
 All tests in `tests/smoke_test.py`. Run with:
 ```bash
@@ -237,6 +237,9 @@ VOICE_ENROLLMENT_DIR=data/enrollments/voices
 - 2026-04-27: Fixed 3 bugs found during testing (FTS5 content_id, route() args, FTS5 triggers).
 - 2026-04-27: Consolidated PROGRESS.md, IMPLEMENTATION_SUMMARY.md, DELIVERABLES.txt, QUICK_REFERENCE.md into this single `process.md`.
 - 2026-04-27: P0 Spike — Created `backend/litellm/client.py` (LLM callable factory), `main.py` (CLI entry point), fixed `persona.py` (optional voice_ref), fixed `tracer.py` (trace_list_recent signature). Agent now runs end-to-end with real LLM via aihubmix.
+- 2026-04-27: B 站 / 网易云 cookie 接入 — 4 个新 MCP server smoke 测试，`scripts/verify_mcp_servers.py` 实测真实 API 通。
+- 2026-04-27: **Agent tool calling 接通** — 新建 `backend/orchestrator/tools.py`（ToolRegistry + 26 工具的 OpenAI schema），重写 `graph.py`（MainGraphState class→TypedDict + tool_decide/tool_execute 节点 + MAX_TOOL_ITERS=3），扩展 `litellm/client.py`（`create_llm_callable_with_tools`），CLI 启动按凭据自动注入 5 个 server 并按 persona+speaker_verify 过滤。`TestOrchestratorGraph` 2 个失败用例随重构修好；新增 12 个 tool 相关测试。Smoke 176/176 通过。
+- 2026-04-27: **真实 LLM 端到端 smoke (7b)** — `python main.py --persona assistant` 跑 `coding-glm-5.1-free`（AIHubMix）三个提示词（`你好` / `搜七里香` / `B 站 1 号直播间标题`）× 2 次，全绿。第二轮 LLM 真实拿到 `pyncm_search_track` 和 `bilibili_get_room_info` 的结果并合成最终回答。一处窄修复：`critic_node` 原 `if "no" in consistency_check.lower()` 子串匹配被 "not"/"noted"/"no problem" 误伤，改为首词匹配 + 任意位置正向词（"yes" / "consistent" / "appropriate"）兜底。Smoke 176/176 仍通过。
 
 ## 10. Next Steps / Roadmap
 
@@ -249,6 +252,8 @@ Priority-ordered:
 5. [x] ~~Configure `backend/litellm/router.yaml` with model endpoints~~ (done — aihubmix + NVIDIA models)
 6. [x] ~~Create at least one real persona~~ (done — `personas/assistant/` with system_prompt, tools, routing, memory_init)
 7. [x] ~~Wire up real `llm_call` in agent loop using litellm~~ (done — `backend/litellm/client.py` + `main.py` CLI)
+7a. [x] ~~Wire LLM tool calling: ToolRegistry + tool_decide/tool_execute graph nodes~~ (done — `backend/orchestrator/tools.py`, refactored `graph.py`, `create_llm_callable_with_tools`)
+7b. [x] ~~Smoke-run tool calling against real AIHubMix model end-to-end~~ (done 2026-04-27 — `coding-glm-5.1-free` via AIHubMix; 3 prompts × 2 runs all green; one narrow critic fix applied — see Change Log)
 8. [ ] Acquire Raspberry Pi 4B + USB camera + mic + BT speaker
 9. [ ] Run `deploy/check_hardware.sh` on Pi
 10. [ ] Install Pi drivers (picamera2, sherpa-onnx, openwakeword, etc.)

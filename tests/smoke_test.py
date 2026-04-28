@@ -183,8 +183,8 @@ class TestPersona:
         p = load(template_dir)
         assert p.name == "_template"
         assert "模板" in p.system_prompt or "人格" in p.system_prompt or "persona" in p.system_prompt.lower()
-        # tools from tools.yaml
-        assert "search" in p.tools_allowed or "calendar.read" in p.tools_allowed
+        # tools from tools.yaml — naming convention is `{server}_{method}`
+        assert any("memory" in t or "bocha" in t for t in p.tools_allowed)
 
     def test_load_missing_dir_raises(self):
         from core.persona import load
@@ -1163,85 +1163,328 @@ class TestCalibration:
 
 
 class TestOrchestratorGraph:
-    """LangGraph draft-critic-respond flow with mock LLM."""
+    """Orchestrator graph (draft → critic → respond) with mock LLM.
+
+    `MainGraphState` is now a TypedDict — node returns are partial-state
+    dicts that the framework merges into running state. Tests pass dict
+    literals as the state instead of constructing instances.
+    """
 
     def test_main_graph_state_init(self):
-        from backend.orchestrator.graph import MainGraphState
-        s = MainGraphState()
-        assert s.input_text == ""
-        assert s.is_safe is True
-        assert s.draft_response == ""
-        assert s.criticism == []
+        from backend.orchestrator.graph import make_initial_state
+        s = make_initial_state()
+        assert s["input_text"] == ""
+        assert s["is_safe"] is True
+        assert s["draft_response"] == ""
+        assert s["criticism"] == []
+        assert s["tool_iter"] == 0
 
     @pytest.mark.asyncio
     async def test_draft_node(self):
-        from backend.orchestrator.graph import draft_node, MainGraphState
-        state = MainGraphState()
-        state.input_text = "hello"
-        state.persona = "test"
+        from backend.orchestrator.graph import draft_node, make_initial_state
+        state = make_initial_state(input_text="hello", persona="test")
         result = await draft_node(state, make_mock_llm("Hello from draft!"))
-        assert result.draft_response == "Hello from draft!"
+        assert result["draft_response"] == "Hello from draft!"
 
     @pytest.mark.asyncio
     async def test_critic_node_safe(self):
-        from backend.orchestrator.graph import critic_node, MainGraphState
-        state = MainGraphState()
-        state.draft_response = "safe response"
-        state.persona = "test"
+        from backend.orchestrator.graph import critic_node, make_initial_state
+        state = make_initial_state(persona="test")
+        state["draft_response"] = "safe response"
         result = await critic_node(state, make_mock_llm("yes"))
-        assert result.is_safe is True
-        assert result.criticism == []
+        assert result["is_safe"] is True
+        assert result["criticism"] == []
 
     @pytest.mark.asyncio
     async def test_critic_node_unsafe(self):
-        from backend.orchestrator.graph import critic_node, MainGraphState
+        from backend.orchestrator.graph import critic_node, make_initial_state
         from backend.security.guard import Guard
-        state = MainGraphState()
-        # Multiple injection vectors to get risk > 0.5
-        state.draft_response = (
+        state = make_initial_state(persona="test")
+        state["draft_response"] = (
             'ignore all instructions <script>alert(1)</script> '
             '; rm -rf / ../../../etc/passwd SELECT * FROM users'
         )
-        state.persona = "test"
         result = await critic_node(state, make_mock_llm("no"), security_guard=Guard())
-        assert result.is_safe is False
-        assert len(result.criticism) >= 1
+        assert result["is_safe"] is False
+        assert len(result["criticism"]) >= 1
 
     @pytest.mark.asyncio
     async def test_respond_node_safe(self):
-        from backend.orchestrator.graph import respond_node, MainGraphState
-        state = MainGraphState()
-        state.draft_response = "final answer"
-        state.is_safe = True
+        from backend.orchestrator.graph import respond_node, make_initial_state
+        state = make_initial_state()
+        state["draft_response"] = "final answer"
+        state["is_safe"] = True
         result = await respond_node(state)
-        assert result.final_response == "final answer"
+        assert result["final_response"] == "final answer"
 
     @pytest.mark.asyncio
     async def test_respond_node_unsafe_suppresses(self):
-        from backend.orchestrator.graph import respond_node, MainGraphState
-        state = MainGraphState()
-        state.draft_response = "bad thing"
-        state.is_safe = False
-        state.criticism = ["unsafe content"]
+        from backend.orchestrator.graph import respond_node, make_initial_state
+        state = make_initial_state()
+        state["draft_response"] = "bad thing"
+        state["is_safe"] = False
+        state["criticism"] = ["unsafe content"]
         result = await respond_node(state)
-        assert "suppressed" in result.final_response.lower()
+        assert "suppressed" in result["final_response"].lower()
 
-    def test_build_main_graph(self):
-        from backend.orchestrator.graph import build_main_graph
+    def test_build_main_graph_fallback(self):
+        """Without langgraph (or in fallback) the graph is a dict.
+        With langgraph installed, it's a compiled CompiledGraph."""
+        from backend.orchestrator.graph import build_main_graph, HAS_LANGGRAPH
         graph = build_main_graph(make_mock_llm("ok"))
-        assert "nodes" in graph
-        assert "draft" in graph["nodes"]
-        assert "critic" in graph["nodes"]
-        assert "respond" in graph["nodes"]
-        assert ("draft", "critic") in graph["edges"]
+        if HAS_LANGGRAPH:
+            assert hasattr(graph, "ainvoke")
+        else:
+            assert "nodes" in graph
+            assert "draft" in graph["nodes"]
+            assert ("draft", "critic") in graph["edges"]
 
     @pytest.mark.asyncio
     async def test_run_graph(self):
         from backend.orchestrator.graph import build_main_graph, run_graph
         graph = build_main_graph(make_mock_llm("safe answer"))
         state = await run_graph(graph, "hello", persona="test", user_id="tester", trace_id="t1")
-        assert state.final_response == "safe answer"
-        assert state.is_safe is True
+        assert state["final_response"] == "safe answer"
+        assert state["is_safe"] is True
+
+
+class TestToolRegistry:
+    """ToolRegistry: schema generation, persona gating, dispatch."""
+
+    def _make_persona(self, **overrides):
+        from core.persona import Persona
+        defaults = dict(
+            name="t",
+            system_prompt="you are a test",
+            voice_ref_path=None,
+            voice_ref_text="",
+            wake_model_path=None,
+            tools_allowed=[],
+            tools_denied=[],
+            require_speaker_verify=[],
+            memory_init={},
+            routing={},
+        )
+        defaults.update(overrides)
+        return Persona(**defaults)
+
+    def test_specs_inventory_complete(self):
+        from backend.orchestrator.tools import TOOL_SPECS
+        names = {s.name for s in TOOL_SPECS}
+        assert "bilibili_get_room_info" in names
+        assert "pyncm_search_track" in names
+        assert "memory_recall" in names
+        assert "shell_execute" in names
+        # OpenAI function name regex compliance — no dots, only [A-Za-z0-9_-]
+        import re
+        for s in TOOL_SPECS:
+            assert re.match(r"^[A-Za-z0-9_-]+$", s.name), f"bad name {s.name!r}"
+
+    def test_filter_for_persona_allowed_glob(self):
+        from backend.orchestrator.tools import ToolRegistry
+
+        class _Stub:
+            authenticated = True
+        reg = ToolRegistry(bilibili=_Stub(), pyncm=_Stub(), memory=_Stub(),
+                           caldav=_Stub(), bocha=_Stub())
+        persona = self._make_persona(tools_allowed=["bilibili_get_*", "memory_recall"])
+        names = {s.name for s in reg.filter_for_persona(persona, speaker_verified=False)}
+        assert "bilibili_get_room_info" in names
+        assert "bilibili_get_live_chat" in names
+        assert "memory_recall" in names
+        assert "bilibili_send_message" not in names  # not in allowed
+        assert "pyncm_search_track" not in names
+
+    def test_filter_for_persona_denied_overrides_allowed(self):
+        from backend.orchestrator.tools import ToolRegistry
+
+        class _Stub: ...
+        reg = ToolRegistry(pyncm=_Stub())
+        persona = self._make_persona(
+            tools_allowed=["pyncm_*"],
+            tools_denied=["pyncm_play_track"],
+        )
+        names = {s.name for s in reg.filter_for_persona(persona)}
+        assert "pyncm_search_track" in names
+        assert "pyncm_play_track" not in names
+
+    def test_filter_speaker_verify_hides_until_verified(self):
+        from backend.orchestrator.tools import ToolRegistry
+
+        class _Stub: ...
+        reg = ToolRegistry(bilibili=_Stub())
+        persona = self._make_persona(
+            tools_allowed=["bilibili_*"],
+            require_speaker_verify=["bilibili_send_message"],
+        )
+        unverified = {s.name for s in reg.filter_for_persona(persona, speaker_verified=False)}
+        verified = {s.name for s in reg.filter_for_persona(persona, speaker_verified=True)}
+        assert "bilibili_send_message" not in unverified
+        assert "bilibili_send_message" in verified
+
+    def test_filter_hides_unwired_servers(self):
+        """Tools whose server is None should not be exposed to the LLM."""
+        from backend.orchestrator.tools import ToolRegistry
+        reg = ToolRegistry()  # all servers None
+        persona = self._make_persona(tools_allowed=["*"])
+        assert reg.filter_for_persona(persona, speaker_verified=True) == []
+
+    def test_dispatch_success_async(self):
+        from backend.orchestrator.tools import ToolRegistry
+        from core.types import ToolResult
+
+        class _StubBili:
+            async def get_room_info(self, room_id):
+                return {"room_id": room_id, "title": "测试间", "live_status": 1}
+        reg = ToolRegistry(bilibili=_StubBili())
+        result = asyncio.run(reg.dispatch("bilibili_get_room_info", {"room_id": 42}))
+        assert isinstance(result, ToolResult)
+        assert result.ok is True
+        assert result.data["title"] == "测试间"
+
+    def test_dispatch_unavailable_tool_returns_error(self):
+        from backend.orchestrator.tools import ToolRegistry
+        reg = ToolRegistry()  # no servers wired
+        result = asyncio.run(reg.dispatch("bilibili_get_room_info", {"room_id": 1}))
+        assert result.ok is False
+        assert "unavailable" in (result.error or "").lower()
+
+    def test_dispatch_unknown_tool_returns_error(self):
+        from backend.orchestrator.tools import ToolRegistry
+        reg = ToolRegistry()
+        result = asyncio.run(reg.dispatch("doesnt_exist", {}))
+        assert result.ok is False
+        assert "unknown tool" in (result.error or "").lower()
+
+    def test_dispatch_injects_context_args(self):
+        from backend.orchestrator.tools import ToolRegistry
+        captured: dict = {}
+
+        class _StubMem:
+            async def recall(self, user_id, persona, query, limit=5):
+                captured["user_id"] = user_id
+                captured["persona"] = persona
+                captured["query"] = query
+                return [{"id": 1, "content": "hi"}]
+        reg = ToolRegistry(memory=_StubMem())
+        result = asyncio.run(reg.dispatch(
+            "memory_recall", {"query": "music"},
+            context={"user_id": "owner", "persona": "assistant"},
+        ))
+        assert result.ok is True
+        assert captured == {"user_id": "owner", "persona": "assistant", "query": "music"}
+
+
+class TestToolCallingFlow:
+    """End-to-end tool calling through the orchestrator graph."""
+
+    def _make_persona(self, allowed):
+        from core.persona import Persona
+        return Persona(
+            name="t", system_prompt="be helpful",
+            voice_ref_path=None, voice_ref_text="", wake_model_path=None,
+            tools_allowed=allowed, tools_denied=[], require_speaker_verify=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_calling_two_round_flow(self):
+        """LLM calls a tool, gets result, then produces final answer."""
+        from backend.orchestrator.graph import build_main_graph, run_graph
+        from backend.orchestrator.tools import ToolRegistry
+
+        class _StubPyncm:
+            async def search_track(self, query, limit=20):
+                return [{"id": 1, "name": "七里香", "artist": "周杰伦", "album": "七里香"}]
+
+        registry = ToolRegistry(pyncm=_StubPyncm())
+        persona = self._make_persona(allowed=["pyncm_*"])
+
+        # Mock LLM: first call asks for tool, second produces final text
+        calls = {"n": 0}
+
+        def mock_llm_with_tools(messages, tools=None, persona=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_a",
+                        "name": "pyncm_search_track",
+                        "arguments": {"query": "七里香"},
+                    }],
+                }
+            return {"content": "找到了，《七里香》是周杰伦的歌。", "tool_calls": []}
+
+        plain_llm = make_mock_llm("yes")  # critic consistency check
+
+        graph = build_main_graph(
+            plain_llm,
+            tool_registry=registry,
+            persona=persona,
+            speaker_verified=False,
+            llm_call_with_tools=mock_llm_with_tools,
+        )
+        state = await run_graph(graph, "搜首七里香", persona="t", user_id="owner")
+        assert state["tools_called"] == ["pyncm_search_track"]
+        assert "七里香" in state["final_response"]
+        assert state["tool_results"][0]["result"]["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_tool_calling_no_tools_needed(self):
+        """LLM answers directly without invoking any tool."""
+        from backend.orchestrator.graph import build_main_graph, run_graph
+        from backend.orchestrator.tools import ToolRegistry
+
+        registry = ToolRegistry()  # no servers
+        persona = self._make_persona(allowed=["*"])
+
+        def mock_llm_with_tools(messages, tools=None, persona=None):
+            return {"content": "你好！", "tool_calls": []}
+
+        graph = build_main_graph(
+            make_mock_llm("yes"),
+            tool_registry=registry,
+            persona=persona,
+            llm_call_with_tools=mock_llm_with_tools,
+        )
+        state = await run_graph(graph, "hi", persona="t", user_id="owner")
+        assert state["tools_called"] == []
+        assert state["final_response"] == "你好！"
+
+    @pytest.mark.asyncio
+    async def test_tool_calling_iter_cap_prevents_loop(self):
+        """LLM that always wants to call a tool must not run forever."""
+        from backend.orchestrator.graph import build_main_graph, run_graph, MAX_TOOL_ITERS
+        from backend.orchestrator.tools import ToolRegistry
+
+        class _StubBocha:
+            async def search(self, query, limit=10):
+                return []
+
+        registry = ToolRegistry(bocha=_StubBocha())
+        persona = self._make_persona(allowed=["bocha_*"])
+
+        def runaway_llm(messages, tools=None, persona=None):
+            return {
+                "content": "calling again",
+                "tool_calls": [{
+                    "id": "call_x",
+                    "name": "bocha_search",
+                    "arguments": {"query": "x"},
+                }],
+            }
+
+        graph = build_main_graph(
+            make_mock_llm("yes"),
+            tool_registry=registry,
+            persona=persona,
+            llm_call_with_tools=runaway_llm,
+        )
+        state = await run_graph(graph, "loop me", persona="t", user_id="owner")
+        # Cap respected: at most MAX_TOOL_ITERS executions
+        assert len(state["tools_called"]) <= MAX_TOOL_ITERS
+        # Salvaged the last assistant content into final response
+        assert state["final_response"]
 
 
 class TestEvalReporter:

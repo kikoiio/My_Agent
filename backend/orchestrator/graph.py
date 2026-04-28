@@ -1,140 +1,424 @@
-"""LangGraph main graph: draft → critic → respond.
+"""LangGraph main graph: draft → (tool_decide ⇄ tool_execute)* → critic → respond.
 
-Per plan.md §10.2:
-- Draft node: Generate initial response
-- Critic node: Check persona consistency + safety
-- Respond node: Finalize and prepare output
+Per plan.md §10.2 + 2026-04-27 tool-calling extension:
+- draft_node: legacy single-turn draft (used when no ToolRegistry is wired)
+- tool_decide_node: ask LLM (with tool schemas) what to do next
+- tool_execute_node: dispatch tool calls; loop back to tool_decide
+- critic_node: persona consistency + safety check
+- respond_node: finalize output
 
-Uses langgraph if installed; falls back to sequential execution otherwise.
+Uses langgraph if installed; falls back to dict-based sequential execution.
+`MainGraphState` is a TypedDict (LangGraph's preferred state type) so node
+returns are partial dicts and the framework merges them.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
+from typing import Any, TypedDict
 
-__all__ = ["build_main_graph", "run_graph", "MainGraphState"]
+__all__ = [
+    "build_main_graph",
+    "run_graph",
+    "MainGraphState",
+    "draft_node",
+    "tool_decide_node",
+    "tool_execute_node",
+    "critic_node",
+    "respond_node",
+    "make_initial_state",
+    "MAX_TOOL_ITERS",
+]
 
 logger = logging.getLogger(__name__)
 
-# Try importing langgraph; fall back gracefully
+MAX_TOOL_ITERS = 3  # safety cap on tool-calling rounds per turn
+
 try:
     from langgraph.graph import StateGraph, END
     HAS_LANGGRAPH = True
-except ImportError:
+except ImportError:  # pragma: no cover
     HAS_LANGGRAPH = False
     logger.debug("langgraph not installed, using sequential fallback")
 
 
-class MainGraphState:
-    """State passed through graph nodes."""
+class MainGraphState(TypedDict, total=False):
+    """State passed through graph nodes.
 
-    def __init__(self):
-        self.input_text: str = ""
-        self.persona: str = ""
-        self.user_id: str = ""
-        self.draft_response: str = ""
-        self.criticism: list[str] = []
-        self.is_safe: bool = True
-        self.final_response: str = ""
-        self.tools_called: list[str] = []
-        self.trace_id: str = ""
+    `total=False` so node returns can be partial-state dicts that LangGraph
+    merges into the running state. Test helpers and `make_initial_state()`
+    populate the full set of fields up front.
+    """
+
+    input_text: str
+    persona: str
+    user_id: str
+    draft_response: str
+    criticism: list[str]
+    is_safe: bool
+    final_response: str
+    tools_called: list[str]
+    tool_results: list[dict]
+    tool_iter: int
+    messages: list[dict]
+    pending_tool_calls: list[dict]
+    trace_id: str
 
 
-async def draft_node(state: MainGraphState, llm_call: Any) -> MainGraphState:
-    """Generate initial draft response."""
+def make_initial_state(
+    *,
+    input_text: str = "",
+    persona: str = "",
+    user_id: str = "",
+    trace_id: str = "",
+) -> MainGraphState:
+    """Build a fully-populated MainGraphState for a new turn."""
+    return {
+        "input_text": input_text,
+        "persona": persona,
+        "user_id": user_id,
+        "draft_response": "",
+        "criticism": [],
+        "is_safe": True,
+        "final_response": "",
+        "tools_called": [],
+        "tool_results": [],
+        "tool_iter": 0,
+        "messages": [],
+        "pending_tool_calls": [],
+        "trace_id": trace_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _call_llm_async(
+    llm_call: Any,
+    system: str,
+    user_msg: str,
+    persona: str,
+) -> str:
+    """Run a sync (system, user_msg, persona) -> str callable in a thread."""
+    import asyncio
+
+    return await asyncio.to_thread(llm_call, system, user_msg, persona)
+
+
+async def _call_llm_with_tools_async(
+    llm_call_with_tools: Any,
+    messages: list[dict],
+    tools: list[dict] | None,
+    persona: str,
+) -> dict:
+    """Run the tool-aware LLM callable.
+
+    The callable may be sync or async; both shapes are tolerated.
+    """
+    import asyncio
+    import inspect as _inspect
+
+    if _inspect.iscoroutinefunction(llm_call_with_tools):
+        return await llm_call_with_tools(messages, tools=tools, persona=persona)
+
+    def _invoke():
+        return llm_call_with_tools(messages, tools=tools, persona=persona)
+
+    result = await asyncio.to_thread(_invoke)
+    if _inspect.isawaitable(result):
+        return await result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+
+async def draft_node(state: MainGraphState, llm_call: Any) -> dict:
+    """Generate initial draft response (no tool calling)."""
     system_msg = "You are a helpful assistant."
-
     draft = await _call_llm_async(
         llm_call,
         system_msg,
-        state.input_text,
-        state.persona,
+        state.get("input_text", ""),
+        state.get("persona", ""),
+    )
+    return {"draft_response": draft}
+
+
+async def tool_decide_node(
+    state: MainGraphState,
+    llm_call_with_tools: Any,
+    tool_registry: Any,
+    persona: Any,
+    *,
+    speaker_verified: bool = False,
+    system_prompt: str = "You are a helpful assistant.",
+) -> dict:
+    """Ask the LLM whether to call a tool or answer directly.
+
+    On entry, `state["messages"]` accumulates the running conversation
+    (system + user + any prior assistant/tool messages). On exit:
+    - If LLM emits tool_calls → write them to `pending_tool_calls`, append
+      the assistant message to history, leave `draft_response` empty.
+    - Otherwise → set `draft_response` to the content, clear pending calls.
+    """
+    messages = list(state.get("messages") or [])
+    if not messages:
+        # First decision pass — seed system + user
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": state.get("input_text", "")},
+        ]
+
+    schemas = tool_registry.schemas_for_persona(persona, speaker_verified=speaker_verified) if tool_registry else None
+
+    response = await _call_llm_with_tools_async(
+        llm_call_with_tools,
+        messages=messages,
+        tools=schemas or None,
+        persona=state.get("persona", ""),
     )
 
-    state.draft_response = draft
-    return state
+    content = response.get("content") or ""
+    tool_calls = response.get("tool_calls") or []
+
+    if tool_calls:
+        # Append the assistant message that proposes tool calls
+        assistant_msg = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": tc.get("id") or f"call_{i}",
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("name", ""),
+                        "arguments": json.dumps(tc.get("arguments") or {}, ensure_ascii=False),
+                    },
+                }
+                for i, tc in enumerate(tool_calls)
+            ],
+        }
+        return {
+            "messages": messages + [assistant_msg],
+            "pending_tool_calls": tool_calls,
+            "draft_response": "",
+        }
+
+    # Plain answer — no tool needed
+    return {
+        "messages": messages + [{"role": "assistant", "content": content}],
+        "pending_tool_calls": [],
+        "draft_response": content,
+    }
+
+
+async def tool_execute_node(
+    state: MainGraphState,
+    tool_registry: Any,
+    *,
+    security_guard: Any = None,
+) -> dict:
+    """Dispatch each pending tool call and append the results to history."""
+    pending = state.get("pending_tool_calls") or []
+    messages = list(state.get("messages") or [])
+    tools_called = list(state.get("tools_called") or [])
+    tool_results = list(state.get("tool_results") or [])
+
+    context = {
+        "user_id": state.get("user_id", ""),
+        "persona": state.get("persona", ""),
+    }
+
+    for tc in pending:
+        name = tc.get("name", "")
+        args = tc.get("arguments") or {}
+        call_id = tc.get("id") or "call_0"
+
+        result = await tool_registry.dispatch(name, args, context=context)
+        result_payload = result.model_dump() if hasattr(result, "model_dump") else dict(result)
+
+        # Wrap external-content tools' output with the security guard so
+        # injected data is tagged as untrusted before re-entering the LLM.
+        serialized = json.dumps(result_payload, ensure_ascii=False, default=str)
+        if security_guard is not None and result_payload.get("ok"):
+            try:
+                wrapped = security_guard.wrap_external(serialized, source=f"tool:{name}")
+                serialized = wrapped.to_xml()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("guard.wrap_external failed for %s: %r", name, e)
+
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": name,
+            "content": serialized,
+        })
+        tools_called.append(name)
+        tool_results.append({"name": name, "args": args, "result": result_payload})
+
+    return {
+        "messages": messages,
+        "tools_called": tools_called,
+        "tool_results": tool_results,
+        "pending_tool_calls": [],
+        "tool_iter": (state.get("tool_iter") or 0) + 1,
+    }
 
 
 async def critic_node(
     state: MainGraphState,
     llm_call: Any,
     security_guard: Any = None,
-) -> MainGraphState:
-    """Critique draft for persona consistency and safety."""
-    criticism = []
+) -> dict:
+    """Critique draft for persona consistency and safety.
+
+    If tool calling exited with no draft (e.g. iteration cap reached while
+    LLM still wanted to call tools), salvage the last non-empty assistant
+    content from message history.
+    """
+    criticism: list[str] = []
+    is_safe = True
+    draft = state.get("draft_response", "") or ""
+    if not draft:
+        for m in reversed(state.get("messages") or []):
+            if m.get("role") == "assistant" and m.get("content"):
+                draft = m["content"]
+                break
 
     if security_guard:
-        wrapped = security_guard.wrap_external(
-            state.draft_response,
-            source="agent_response",
-        )
+        wrapped = security_guard.wrap_external(draft, source="agent_response")
         if not security_guard.is_safe(wrapped):
             criticism.append("Response contains potential injection patterns")
-            state.is_safe = False
+            is_safe = False
 
-    consistency_prompt = f"""Evaluate if this response maintains the persona:
-PERSONA: {state.persona}
-RESPONSE: {state.draft_response}
-
-Is the response consistent with the persona? (yes/no)"""
+    consistency_prompt = (
+        "Evaluate if this response maintains the persona:\n"
+        f"PERSONA: {state.get('persona', '')}\n"
+        f"RESPONSE: {draft}\n\n"
+        "Is the response consistent with the persona? (yes/no)"
+    )
 
     consistency_check = await _call_llm_async(
         llm_call,
         "You are evaluating response consistency.",
         consistency_prompt,
-        state.persona,
+        state.get("persona", ""),
     )
 
-    if "no" in consistency_check.lower():
+    # Substring `"no" in ...` was tripping on "not", "noted", "no problem".
+    # Check leading verdict word, and require no positive signal anywhere —
+    # the consistency LLM is non-deterministic and only the persona *name*
+    # is in scope, so bias toward accept when the answer is mixed.
+    text = consistency_check.strip().lower()
+    first = text.split(maxsplit=1)[0].rstrip(".,!?:;'\"") if text else ""
+    has_positive = "yes" in text or "consistent" in text or "appropriate" in text
+    if first in ("no", "否", "不") and not has_positive:
         criticism.append("Response breaks persona")
 
-    state.criticism = criticism
-    return state
+    return {"criticism": criticism, "is_safe": is_safe, "draft_response": draft}
 
 
-async def respond_node(state: MainGraphState) -> MainGraphState:
+async def respond_node(state: MainGraphState) -> dict:
     """Finalize response preparation."""
-    if not state.is_safe or state.criticism:
-        state.final_response = (
-            f"[Critique detected: {'; '.join(state.criticism)}] "
-            f"Original response suppressed for safety."
-        )
-    else:
-        state.final_response = state.draft_response
+    if not state.get("is_safe", True) or state.get("criticism"):
+        criticism = state.get("criticism") or []
+        return {
+            "final_response": (
+                f"[Critique detected: {'; '.join(criticism)}] "
+                "Original response suppressed for safety."
+            )
+        }
+    return {"final_response": state.get("draft_response", "")}
 
-    return state
+
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
 
 
-def build_main_graph(llm_call: Any, security_guard: Any = None) -> Any:
-    """Build LangGraph main graph (draft → critic → respond).
+def build_main_graph(
+    llm_call: Any,
+    security_guard: Any = None,
+    *,
+    tool_registry: Any = None,
+    persona: Any = None,
+    speaker_verified: bool = False,
+    llm_call_with_tools: Any = None,
+    system_prompt: str = "You are a helpful assistant.",
+) -> Any:
+    """Build the orchestrator graph.
 
-    Uses langgraph StateGraph if available, falls back to dict-based
-    sequential execution.
+    Two operating modes:
 
-    Args:
-        llm_call: LLM callable (system_msg, user_msg, persona) -> str
-        security_guard: Optional security Guard instance
+    1. Plain mode (`tool_registry is None`): legacy draft → critic → respond.
+       Backwards-compatible with existing tests / callers.
+    2. Tool-calling mode (`tool_registry` provided): tool_decide → tool_execute
+       loop (≤ MAX_TOOL_ITERS rounds) → critic → respond. Requires either
+       `llm_call_with_tools` (preferred) or falls back to wrapping `llm_call`.
 
-    Returns:
-        Compiled langgraph graph or dict-based fallback
+    `persona` only matters in tool-calling mode (filters which tools the LLM
+    sees). `speaker_verified=False` masks `require_speaker_verify` tools.
     """
+    if tool_registry is not None:
+        ll_tools = llm_call_with_tools or _adapt_plain_to_tools(llm_call)
+        if HAS_LANGGRAPH:
+            return _build_langgraph_with_tools(
+                llm_call, ll_tools, security_guard, tool_registry, persona,
+                speaker_verified, system_prompt,
+            )
+        return _build_fallback_with_tools(
+            llm_call, ll_tools, security_guard, tool_registry, persona,
+            speaker_verified, system_prompt,
+        )
+
     if HAS_LANGGRAPH:
         return _build_langgraph(llm_call, security_guard)
     return _build_fallback(llm_call, security_guard)
 
 
+def _adapt_plain_to_tools(llm_call: Any) -> Any:
+    """Wrap a plain (system, user, persona) -> str callable so it conforms to
+    the tool-aware interface (always returning empty tool_calls).
+
+    Only used when caller asked for tool mode but didn't supply a
+    tool-aware callable. Useful for tests with mock LLMs.
+    """
+
+    def _adapted(messages: list[dict], tools=None, persona=None):
+        system = ""
+        user_parts: list[str] = []
+        for m in messages:
+            role = m.get("role")
+            if role == "system":
+                system = m.get("content") or ""
+            elif role in ("user", "tool"):
+                user_parts.append(m.get("content") or "")
+        user_msg = "\n".join(user_parts)
+        out = llm_call(system, user_msg, persona)
+        return {"content": out, "tool_calls": []}
+
+    return _adapted
+
+
+# --- legacy plain graph (back-compat) ---
+
+
 def _build_langgraph(llm_call: Any, security_guard: Any = None) -> Any:
-    """Build real langgraph StateGraph."""
     builder = StateGraph(MainGraphState)
 
-    async def draft_wrapper(state: MainGraphState) -> MainGraphState:
+    async def draft_wrapper(state: MainGraphState) -> dict:
         return await draft_node(state, llm_call)
 
-    async def critic_wrapper(state: MainGraphState) -> MainGraphState:
+    async def critic_wrapper(state: MainGraphState) -> dict:
         return await critic_node(state, llm_call, security_guard)
 
-    async def respond_wrapper(state: MainGraphState) -> MainGraphState:
+    async def respond_wrapper(state: MainGraphState) -> dict:
         return await respond_node(state)
 
     builder.add_node("draft", draft_wrapper)
@@ -150,19 +434,107 @@ def _build_langgraph(llm_call: Any, security_guard: Any = None) -> Any:
 
 
 def _build_fallback(llm_call: Any, security_guard: Any = None) -> dict:
-    """Build dict-based fallback graph (sequential execution)."""
     return {
         "nodes": {
             "draft": lambda state: draft_node(state, llm_call),
             "critic": lambda state: critic_node(state, llm_call, security_guard),
             "respond": lambda state: respond_node(state),
         },
+        "edges": [("draft", "critic"), ("critic", "respond")],
+        "_langgraph_fallback": True,
+        "_mode": "plain",
+    }
+
+
+# --- tool-calling graph ---
+
+
+def _route_after_decide(state: MainGraphState) -> str:
+    if state.get("pending_tool_calls"):
+        if (state.get("tool_iter") or 0) >= MAX_TOOL_ITERS:
+            return "critic"
+        return "tool_execute"
+    return "critic"
+
+
+def _build_langgraph_with_tools(
+    llm_call: Any,
+    llm_call_with_tools: Any,
+    security_guard: Any,
+    tool_registry: Any,
+    persona: Any,
+    speaker_verified: bool,
+    system_prompt: str,
+) -> Any:
+    builder = StateGraph(MainGraphState)
+
+    async def decide_wrapper(state: MainGraphState) -> dict:
+        return await tool_decide_node(
+            state, llm_call_with_tools, tool_registry, persona,
+            speaker_verified=speaker_verified, system_prompt=system_prompt,
+        )
+
+    async def execute_wrapper(state: MainGraphState) -> dict:
+        return await tool_execute_node(state, tool_registry, security_guard=security_guard)
+
+    async def critic_wrapper(state: MainGraphState) -> dict:
+        return await critic_node(state, llm_call, security_guard)
+
+    async def respond_wrapper(state: MainGraphState) -> dict:
+        return await respond_node(state)
+
+    builder.add_node("tool_decide", decide_wrapper)
+    builder.add_node("tool_execute", execute_wrapper)
+    builder.add_node("critic", critic_wrapper)
+    builder.add_node("respond", respond_wrapper)
+
+    builder.set_entry_point("tool_decide")
+    builder.add_conditional_edges("tool_decide", _route_after_decide, {
+        "tool_execute": "tool_execute",
+        "critic": "critic",
+    })
+    builder.add_edge("tool_execute", "tool_decide")
+    builder.add_edge("critic", "respond")
+    builder.add_edge("respond", END)
+
+    return builder.compile()
+
+
+def _build_fallback_with_tools(
+    llm_call: Any,
+    llm_call_with_tools: Any,
+    security_guard: Any,
+    tool_registry: Any,
+    persona: Any,
+    speaker_verified: bool,
+    system_prompt: str,
+) -> dict:
+    return {
+        "nodes": {
+            "tool_decide": lambda state: tool_decide_node(
+                state, llm_call_with_tools, tool_registry, persona,
+                speaker_verified=speaker_verified, system_prompt=system_prompt,
+            ),
+            "tool_execute": lambda state: tool_execute_node(
+                state, tool_registry, security_guard=security_guard,
+            ),
+            "critic": lambda state: critic_node(state, llm_call, security_guard),
+            "respond": lambda state: respond_node(state),
+        },
         "edges": [
-            ("draft", "critic"),
+            ("tool_decide", "tool_execute"),
+            ("tool_execute", "tool_decide"),
+            ("tool_decide", "critic"),
             ("critic", "respond"),
         ],
         "_langgraph_fallback": True,
+        "_mode": "tools",
     }
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
 
 
 async def run_graph(
@@ -172,44 +544,42 @@ async def run_graph(
     user_id: str = "owner",
     trace_id: str = "",
 ) -> MainGraphState:
-    """Execute graph on input.
+    """Execute graph on input."""
+    state = make_initial_state(
+        input_text=input_text, persona=persona, user_id=user_id, trace_id=trace_id,
+    )
 
-    Works with both langgraph compiled graphs and dict-based fallback.
-
-    Args:
-        graph: Compiled graph (from build_main_graph) or dict fallback
-        input_text: User input
-        persona: Persona name
-        user_id: User ID
-        trace_id: Trace ID for observability
-
-    Returns:
-        Final graph state
-    """
-    state = MainGraphState()
-    state.input_text = input_text
-    state.persona = persona
-    state.user_id = user_id
-    state.trace_id = trace_id
-
-    # langgraph compiled graph
+    # Compiled LangGraph
     if HAS_LANGGRAPH and not isinstance(graph, dict):
-        return await graph.ainvoke(state)
+        result = await graph.ainvoke(state)
+        return result  # LangGraph already returns MainGraphState (dict)
 
-    # Dict-based fallback: run nodes sequentially
+    # Dict-based fallback
     nodes = graph.get("nodes", {})
-    if "draft" in nodes:
-        state = await nodes["draft"](state)
-    if "critic" in nodes:
-        state = await nodes["critic"](state)
-    if "respond" in nodes:
-        state = await nodes["respond"](state)
+    mode = graph.get("_mode", "plain")
 
+    def _merge(s: MainGraphState, patch: Any) -> MainGraphState:
+        if not patch:
+            return s
+        merged = dict(s)
+        merged.update(patch)
+        return merged  # type: ignore[return-value]
+
+    if mode == "plain":
+        for step in ("draft", "critic", "respond"):
+            if step in nodes:
+                state = _merge(state, await nodes[step](state))
+        return state
+
+    # tool-calling mode
+    for _ in range(MAX_TOOL_ITERS + 1):
+        state = _merge(state, await nodes["tool_decide"](state))
+        if not state.get("pending_tool_calls"):
+            break
+        if (state.get("tool_iter") or 0) >= MAX_TOOL_ITERS:
+            break
+        state = _merge(state, await nodes["tool_execute"](state))
+
+    state = _merge(state, await nodes["critic"](state))
+    state = _merge(state, await nodes["respond"](state))
     return state
-
-
-async def _call_llm_async(llm_call: Any, system: str, user_msg: str, persona: str) -> str:
-    """Async wrapper for LLM calls."""
-    import asyncio
-
-    return await asyncio.to_thread(llm_call, system, user_msg, persona)

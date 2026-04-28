@@ -1,17 +1,20 @@
-# 该人格可见的工具白名单 / 黑名单。
-# allowed 支持 glob：`pyncm-music.*` 等于该 MCP server 下全部工具。
-# require_speaker_verify 内的工具调用前必须再做一次主人声纹验证。
+# 模板人格 — 默认放最保守的只读工具集。
+# 复制为新人格后再按需打开。
+# 工具命名形如 `{server}_{method}`，glob 用 fnmatch 风格。
 
 allowed:
-  - search.*
-  - calendar.read
-  - lark.send_dm
+  - memory_recall
+  - memory_get_summary
+  - bocha_search
 
 denied:
-  - shell.*
-  - bilibili.post_dynamic   # 默认不允许代发 B 站动态；按需启用
+  - shell_*
+  - browser_*
+  - bilibili_send_message
 
 require_speaker_verify:
-  - bilibili.post_dynamic
-  - bilibili.send_dm
-  - memory.delete
+  - memory_store        # 模板默认连写记忆都需要声纹
+  - bilibili_send_message
+  - caldav_create_event
+  - caldav_delete_event
+  - caldav_update_event
