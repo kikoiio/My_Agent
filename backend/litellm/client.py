@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, AsyncGenerator, Callable
 
 import yaml
 from dotenv import load_dotenv
@@ -201,6 +202,82 @@ def create_llm_callable_with_tools(
         return {"content": content, "tool_calls": parsed_calls}
 
     return llm_call_with_tools
+
+
+def create_llm_stream(
+    role: str = "default_fast",
+) -> Callable[..., AsyncGenerator[str, None]]:
+    """Token-streaming variant of create_llm_callable.
+
+    Returns an async generator callable with signature::
+
+        async def llm_stream(
+            system_prompt: str,
+            user_msg: str,
+            persona: Persona | None = None,
+        ) -> AsyncGenerator[str, None]
+
+    Each yielded value is a partial text chunk (non-empty string).
+    Falls back to yielding the full response as one chunk if streaming fails.
+    """
+    model_map = _build_model_map()
+    cfg = model_map.get(role, model_map.get("default_fast", {}))
+    if not cfg:
+        raise ValueError(f"No model config found for role '{role}'")
+
+    model_name = cfg["model"]
+    api_base = cfg["api_base"]
+    api_key = cfg["api_key"]
+    temperature = cfg["temperature"]
+
+    if api_base and "nvidia" in api_base.lower():
+        litellm_model = f"nvidia/{model_name}"
+    elif api_base and "aihubmix" in api_base.lower():
+        litellm_model = f"openai/{model_name}"
+    else:
+        litellm_model = model_name
+
+    async def llm_stream(
+        system_prompt: str,
+        user_msg: str,
+        persona: Persona | None = None,
+    ) -> AsyncGenerator[str, None]:
+        import litellm
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+        kwargs: dict[str, Any] = dict(
+            model=litellm_model,
+            messages=messages,
+            api_base=api_base,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=cfg["max_output"],
+            timeout=30,
+            stream=True,
+        )
+
+        def _sync_stream():
+            return litellm.completion(**kwargs)
+
+        try:
+            response = await asyncio.to_thread(_sync_stream)
+            for chunk in response:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    yield delta
+        except Exception:
+            # Fallback: non-streaming call
+            kwargs.pop("stream", None)
+            response = await asyncio.to_thread(lambda: litellm.completion(**kwargs))
+            content = response.choices[0].message.content or ""
+            if content:
+                yield content
+
+    # Return the async generator function itself
+    return llm_stream  # type: ignore[return-value]
 
 
 def get_llm_callable_for_route(routed_role: str) -> Callable[[str, str, Persona], str]:

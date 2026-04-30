@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
-__all__ = ["WakeWordListener"]
+__all__ = ["WakeWordListener", "MultiWakeWordListener", "load_wake_words_from_personas"]
 
 logger = logging.getLogger(__name__)
 
@@ -146,3 +147,37 @@ class MultiWakeWordListener:
     async def get_active_listeners(self) -> list[str]:
         """Get currently active listener personas."""
         return [p for p, l in self.listeners.items() if l.running]
+
+
+def load_wake_words_from_personas(personas_dir: str | Path = "personas") -> dict[str, str]:
+    """Build a {wake_word: persona_id} mapping from all persona directories.
+
+    Reads each persona's persona.yaml (if present) for the `wake_word` field.
+    Falls back to the directory name when the field is absent.
+
+    Returns:
+        Dict mapping wake word string → persona directory name (persona_id).
+    """
+    import yaml
+
+    root = Path(personas_dir)
+    if not root.is_dir():
+        return {}
+
+    result: dict[str, str] = {}
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith("_") or d.name.startswith("."):
+            continue
+        persona_id = d.name
+        persona_yaml = d / "persona.yaml"
+        wake_word = persona_id  # default
+        if persona_yaml.exists():
+            try:
+                meta = yaml.safe_load(persona_yaml.read_text(encoding="utf-8")) or {}
+                wake_word = meta.get("wake_word") or meta.get("name") or persona_id
+            except Exception as e:
+                logger.warning(f"Failed to read persona.yaml for {persona_id}: {e}")
+        result[wake_word] = persona_id
+
+    logger.debug(f"Loaded {len(result)} wake words: {list(result.keys())}")
+    return result

@@ -450,6 +450,41 @@ class MemoryStore:
                 )
                 conn.commit()
 
+    def query_emotion_trend(
+        self,
+        user_id: str,
+        persona: str,
+        days: int = 7,
+        negative_keywords: tuple[str, ...] = (
+            "难过", "焦虑", "沮丧", "不开心", "担心", "压力", "伤心",
+            "sad", "anxious", "depressed", "stressed", "unhappy",
+        ),
+    ) -> list[DreamEntry]:
+        """Return L3 dream entries from last N days whose summary contains negative keywords."""
+        cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+        with self._lock:
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT id, user_id, persona, timestamp, category, summary, "
+                    "source_episode_ids_json, quality_score FROM dreams "
+                    "WHERE user_id=? AND timestamp>=? ORDER BY timestamp DESC",
+                    (user_id, cutoff),
+                ).fetchall()
+        entries = [
+            DreamEntry(
+                id=row[0],
+                user_id=row[1],
+                persona=row[2],
+                timestamp=row[3],
+                category=row[4],
+                summary=row[5],
+                source_episode_ids=json.loads(row[6] or "[]"),
+                quality_score=row[7],
+            )
+            for row in rows
+        ]
+        return [e for e in entries if any(kw in e.summary for kw in negative_keywords)]
+
     # ============ Cleanup Methods ============
 
     def prune_old_episodes(self, user_id: str, persona: str, keep_hours: int = 720) -> int:

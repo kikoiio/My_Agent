@@ -53,6 +53,7 @@ class MainGraphState(TypedDict, total=False):
 
     input_text: str
     persona: str
+    active_persona_id: str  # persona 目录名，用于 L2 记忆路由（如 "xiaolin", "assistant"）
     user_id: str
     draft_response: str
     criticism: list[str]
@@ -70,13 +71,19 @@ def make_initial_state(
     *,
     input_text: str = "",
     persona: str = "",
+    active_persona_id: str = "",
     user_id: str = "",
     trace_id: str = "",
 ) -> MainGraphState:
-    """Build a fully-populated MainGraphState for a new turn."""
+    """Build a fully-populated MainGraphState for a new turn.
+
+    `active_persona_id` is the persona directory key (e.g. "xiaolin") used to
+    route L2 episodic memory reads/writes.  Defaults to `persona` when omitted.
+    """
     return {
         "input_text": input_text,
         "persona": persona,
+        "active_persona_id": active_persona_id or persona,
         "user_id": user_id,
         "draft_response": "",
         "criticism": [],
@@ -233,6 +240,7 @@ async def tool_execute_node(
     context = {
         "user_id": state.get("user_id", ""),
         "persona": state.get("persona", ""),
+        "active_persona_id": state.get("active_persona_id") or state.get("persona", ""),
     }
 
     for tc in pending:
@@ -298,27 +306,35 @@ async def critic_node(
             is_safe = False
 
     consistency_prompt = (
-        "Evaluate if this response maintains the persona:\n"
+        "Evaluate if this response maintains the persona.\n"
         f"PERSONA: {state.get('persona', '')}\n"
         f"RESPONSE: {draft}\n\n"
-        "Is the response consistent with the persona? (yes/no)"
+        'Return JSON only, no extra text: {"consistent": true, "reason": "..."}'
     )
 
-    consistency_check = await _call_llm_async(
+    raw_check = await _call_llm_async(
         llm_call,
-        "You are evaluating response consistency.",
+        "You are a consistency evaluator. Return only JSON.",
         consistency_prompt,
         state.get("persona", ""),
     )
 
-    # Substring `"no" in ...` was tripping on "not", "noted", "no problem".
-    # Check leading verdict word, and require no positive signal anywhere —
-    # the consistency LLM is non-deterministic and only the persona *name*
-    # is in scope, so bias toward accept when the answer is mixed.
-    text = consistency_check.strip().lower()
-    first = text.split(maxsplit=1)[0].rstrip(".,!?:;'\"") if text else ""
-    has_positive = "yes" in text or "consistent" in text or "appropriate" in text
-    if first in ("no", "否", "不") and not has_positive:
+    import json as _json
+
+    is_consistent = True
+    try:
+        # Strip markdown code fences if model wraps its JSON
+        cleaned = raw_check.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        obj = _json.loads(cleaned)
+        is_consistent = bool(obj.get("consistent", True))
+    except Exception:
+        # Fallback: heuristic word matching (kept for robustness)
+        text = raw_check.strip().lower()
+        first = text.split(maxsplit=1)[0].rstrip(".,!?:;'\"") if text else ""
+        has_positive = "yes" in text or "consistent" in text or "appropriate" in text
+        is_consistent = not (first in ("no", "否", "不") and not has_positive)
+
+    if not is_consistent:
         criticism.append("Response breaks persona")
 
     return {"criticism": criticism, "is_safe": is_safe, "draft_response": draft}
@@ -543,10 +559,15 @@ async def run_graph(
     persona: str,
     user_id: str = "owner",
     trace_id: str = "",
+    active_persona_id: str = "",
 ) -> MainGraphState:
     """Execute graph on input."""
     state = make_initial_state(
-        input_text=input_text, persona=persona, user_id=user_id, trace_id=trace_id,
+        input_text=input_text,
+        persona=persona,
+        active_persona_id=active_persona_id or persona,
+        user_id=user_id,
+        trace_id=trace_id,
     )
 
     # Compiled LangGraph

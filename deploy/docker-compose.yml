@@ -14,8 +14,6 @@ services:
       - "8000:8000"  # Pipecat WebSocket
       - "8080:8080"  # Dashboard
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
       - BACKEND_HOST=0.0.0.0
       - BACKEND_PORT=8000
@@ -76,6 +74,28 @@ services:
     networks:
       - agent-net
     restart: unless-stopped
+
+  # Proactive awareness scanner — polls every 5 minutes
+  proactive:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: voice-agent-proactive
+    command: >
+      sh -c "while true; do python scripts/run_proactive.py; sleep 300; done"
+    environment:
+      - MEMORY_DB_PATH=/app/data/memory.db
+      - PROACTIVE_USER_ID=${PROACTIVE_USER_ID:-owner}
+      - PROACTIVE_PERSONA=${PROACTIVE_PERSONA:-assistant}
+    env_file:
+      - backend/secrets/llm_keys.env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - agent-net
+    restart: unless-stopped
+    depends_on:
+      - backend
 
   # Optional: Self-hosted CosyVoice TTS server
   cosyvoice-tts:

@@ -1255,6 +1255,7 @@ class TestToolRegistry:
         from core.persona import Persona
         defaults = dict(
             name="t",
+            wake_word="t",
             system_prompt="you are a test",
             voice_ref_path=None,
             voice_ref_text="",
@@ -1381,7 +1382,7 @@ class TestToolCallingFlow:
     def _make_persona(self, allowed):
         from core.persona import Persona
         return Persona(
-            name="t", system_prompt="be helpful",
+            name="t", wake_word="t", system_prompt="be helpful",
             voice_ref_path=None, voice_ref_text="", wake_model_path=None,
             tools_allowed=allowed, tools_denied=[], require_speaker_verify=[],
         )
@@ -1689,3 +1690,1114 @@ class TestCircuitBreakerIntegration:
         # Long message routes to smart
         result = route("分析" * 100, state)
         assert result == "default_smart"
+
+
+# ---------------------------------------------------------------------------
+# Bocha web search
+# ---------------------------------------------------------------------------
+
+
+class TestBochaSearchServer:
+    """BochaSearchServer — real HTTP client with graceful degradation."""
+
+    def test_no_api_key_returns_empty(self):
+        from backend.mcp_servers.bocha_search import BochaSearchServer
+        srv = BochaSearchServer(api_key=None)
+        assert asyncio.run(srv.search("test")) == []
+        assert asyncio.run(srv.search_news("test")) == []
+        assert asyncio.run(srv.search_images("test")) == []
+
+    def test_search_parses_response(self, monkeypatch):
+        from backend.mcp_servers.bocha_search import BochaSearchServer
+        import types, sys
+
+        fake_resp_data = {
+            "webPages": {
+                "value": [
+                    {"name": "Result Title", "url": "https://example.com", "snippet": "A snippet"},
+                ]
+            }
+        }
+
+        class _FakeResp:
+            status = 200
+            async def json(self): return fake_resp_data
+            def raise_for_status(self): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        class _FakeSession:
+            def post(self, *a, **kw): return _FakeResp()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        fake_aiohttp = types.ModuleType("aiohttp")
+        fake_aiohttp.ClientSession = _FakeSession
+        fake_aiohttp.ClientTimeout = lambda **kw: None
+        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+        srv = BochaSearchServer(api_key="fake-key")
+        results = asyncio.run(srv.search("AI news", limit=5))
+        assert len(results) == 1
+        assert results[0]["title"] == "Result Title"
+        assert results[0]["url"] == "https://example.com"
+        assert results[0]["snippet"] == "A snippet"
+
+    def test_search_graceful_on_http_error(self, monkeypatch):
+        from backend.mcp_servers.bocha_search import BochaSearchServer
+        import types, sys
+
+        class _ErrorResp:
+            def raise_for_status(self): raise Exception("HTTP 500")
+            async def json(self): return {}
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        class _ErrSession:
+            def post(self, *a, **kw): return _ErrorResp()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        fake_aiohttp = types.ModuleType("aiohttp")
+        fake_aiohttp.ClientSession = _ErrSession
+        fake_aiohttp.ClientTimeout = lambda **kw: None
+        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+        srv = BochaSearchServer(api_key="fake-key")
+        assert asyncio.run(srv.search("test")) == []
+
+    def test_search_news_uses_freshness_day(self, monkeypatch):
+        from backend.mcp_servers.bocha_search import BochaSearchServer
+        import types, sys
+
+        captured: list[dict] = []
+
+        class _FakeResp:
+            async def json(self): return {"webPages": {"value": []}}
+            def raise_for_status(self): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        class _FakeSession:
+            def post(self, url, *, headers, json, timeout): # type: ignore[override]
+                captured.append(json)
+                return _FakeResp()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        fake_aiohttp = types.ModuleType("aiohttp")
+        fake_aiohttp.ClientSession = _FakeSession
+        fake_aiohttp.ClientTimeout = lambda **kw: None
+        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+        srv = BochaSearchServer(api_key="fake-key")
+        asyncio.run(srv.search_news("latest", limit=3))
+        assert captured and captured[0].get("freshness") == "Day"
+
+
+# ---------------------------------------------------------------------------
+# CosyVoice TTS client
+# ---------------------------------------------------------------------------
+
+
+class TestCosyVoiceClient:
+    """CosyVoiceClient — availability flag and endpoint stubs."""
+
+    def test_not_available_without_endpoints(self):
+        from backend.tts.cosyvoice_client import CosyVoiceClient
+        c = CosyVoiceClient()
+        assert c.is_available() is False
+
+    def test_available_with_dashscope_key(self):
+        from backend.tts.cosyvoice_client import CosyVoiceClient
+        c = CosyVoiceClient(dashscope_api_key="fake-key")
+        assert c.is_available() is True
+
+    def test_self_hosted_returns_audio(self, monkeypatch):
+        from backend.tts.cosyvoice_client import CosyVoiceClient
+        import types, sys
+
+        audio_bytes = b"\x00\x01\x02"
+
+        class _FakeResp:
+            async def read(self): return audio_bytes
+            def raise_for_status(self): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        class _FakeSession:
+            def post(self, *a, **kw): return _FakeResp()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        fake_aiohttp = types.ModuleType("aiohttp")
+        fake_aiohttp.ClientSession = _FakeSession
+        fake_aiohttp.ClientTimeout = lambda **kw: None
+        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+        c = CosyVoiceClient(self_hosted_url="http://localhost:8000")
+        result = asyncio.run(c.synthesize("你好"))
+        assert result == audio_bytes
+
+
+# ---------------------------------------------------------------------------
+# Credential expiry detection
+# ---------------------------------------------------------------------------
+
+
+class TestCredentialExpiry:
+    """Bilibili + Pyncm mark authenticated=False when API signals credential expiry."""
+
+    def test_bilibili_marks_unauthenticated_on_401_error(self, tmp_path, monkeypatch):
+        from backend.mcp_servers.bilibili import BilibiliServer
+        import sys, types
+
+        # Stub bilibili_api so the credential file loads
+        cred_path = tmp_path / "cred.json"
+        cred_path.write_text(
+            '{"sessdata":"s","bili_jct":"j","buvid3":"b","dedeuserid":"1"}',
+            encoding="utf-8",
+        )
+        fake_ba = types.ModuleType("bilibili_api")
+        fake_ba.Credential = lambda **kw: dict(kw)
+        monkeypatch.setitem(sys.modules, "bilibili_api", fake_ba)
+
+        srv = BilibiliServer(credential_file=str(cred_path))
+        assert srv.authenticated is True
+
+        # Simulate 401 error from the live API
+        async def _fail(*a, **kw):
+            raise Exception("ResponseCodeException: 401 invalid credential SESSDATA expired")
+
+        monkeypatch.setattr(srv, "_credential", {})
+        # Patch live.LiveRoom to raise on get_room_info
+        class _FakeRoom:
+            def __init__(self, *a, **kw): pass
+            async def get_room_info(self): raise Exception("401 invalid credential")
+
+        fake_live = types.ModuleType("bilibili_api.live")
+        fake_live.LiveRoom = _FakeRoom
+        monkeypatch.setitem(sys.modules, "bilibili_api.live", fake_live)
+
+        import bilibili_api  # already monkeypatched
+        monkeypatch.setattr(bilibili_api, "live", fake_live, raising=False)
+
+        # Import `live` inside the method — patch it on the module directly
+        import importlib
+        import backend.mcp_servers.bilibili as _bil_mod
+        monkeypatch.setattr(_bil_mod, "__builtins__", __builtins__)
+
+        asyncio.run(srv.get_room_info(123))
+        assert srv.authenticated is False
+
+    def test_pyncm_marks_unauthenticated_on_login_error(self, tmp_path, monkeypatch):
+        from backend.mcp_servers.pyncm import PyncmServer
+        import sys, types
+
+        cred_path = tmp_path / "pyncm.json"
+        cred_path.write_text(
+            '{"login_info":{},"cookies":{}}',
+            encoding="utf-8",
+        )
+        class _StubSession:
+            def load(self, data): pass
+        fake_pyncm = types.ModuleType("pyncm")
+        fake_pyncm.Session = _StubSession
+        fake_pyncm.SetCurrentSession = lambda s: None
+        monkeypatch.setitem(sys.modules, "pyncm", fake_pyncm)
+
+        srv = PyncmServer(credential_file=str(cred_path))
+        assert srv.authenticated is True
+
+        # Simulate "need login" error from pyncm API
+        class _FakeSearch:
+            @staticmethod
+            def GetSearchResult(query, stype=1, limit=20):
+                raise Exception("need login to access this resource")
+
+        fake_cs = types.ModuleType("pyncm.apis.cloudsearch")
+        fake_cs.GetSearchResult = _FakeSearch.GetSearchResult
+        monkeypatch.setitem(sys.modules, "pyncm.apis.cloudsearch", fake_cs)
+        monkeypatch.setitem(sys.modules, "pyncm.apis", types.ModuleType("pyncm.apis"))
+
+        asyncio.run(srv.search_track("test"))
+        assert srv.authenticated is False
+
+
+# ===========================================================================
+# P2 Tests — Persona wake_word + per-persona memory + memory router
+# ===========================================================================
+
+
+class TestPersonaWakeWord:
+    """Persona dataclass has wake_word; load_wake_words_from_personas builds mapping."""
+
+    def test_persona_has_wake_word_field(self):
+        from core.persona import Persona
+        import dataclasses
+        field_names = {f.name for f in dataclasses.fields(Persona)}
+        assert "wake_word" in field_names
+
+    def test_wake_word_defaults_to_name_when_no_yaml(self, tmp_path):
+        """When persona.yaml is absent, load() uses the directory name as wake_word."""
+        from core.persona import load
+        pd = tmp_path / "mybot"
+        pd.mkdir()
+        (pd / "system_prompt.md").write_text("You are mybot.", encoding="utf-8")
+        p = load(pd)
+        assert p.wake_word == "mybot"
+
+    def test_wake_word_read_from_persona_yaml(self, tmp_path):
+        """wake_word is read from persona.yaml when present."""
+        import yaml
+        from core.persona import load
+        pd = tmp_path / "xiaoai"
+        pd.mkdir()
+        (pd / "system_prompt.md").write_text("You are xiaoai.", encoding="utf-8")
+        (pd / "persona.yaml").write_text(
+            yaml.dump({"name": "小爱", "wake_word": "小爱"}), encoding="utf-8"
+        )
+        p = load(pd)
+        assert p.wake_word == "小爱"
+
+    def test_load_wake_words_from_personas(self, tmp_path):
+        """load_wake_words_from_personas returns {wake_word: persona_id}."""
+        import yaml
+        from edge.wakeword import load_wake_words_from_personas
+
+        for dir_name, ww in [("botA", "botA"), ("botB", "芭芭")]:
+            d = tmp_path / dir_name
+            d.mkdir()
+            (d / "persona.yaml").write_text(
+                yaml.dump({"name": dir_name, "wake_word": ww}), encoding="utf-8"
+            )
+
+        mapping = load_wake_words_from_personas(tmp_path)
+        assert mapping["botA"] == "botA"
+        assert mapping["芭芭"] == "botB"
+
+    def test_load_wake_words_skips_template_dirs(self, tmp_path):
+        """Directories starting with _ are ignored."""
+        import yaml
+        from edge.wakeword import load_wake_words_from_personas
+
+        (tmp_path / "_template").mkdir()
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "persona.yaml").write_text(
+            yaml.dump({"wake_word": "real"}), encoding="utf-8"
+        )
+
+        mapping = load_wake_words_from_personas(tmp_path)
+        assert "_template" not in mapping
+        assert "real" in mapping
+
+    def test_system_jinja2_accepted_as_system_prompt(self, tmp_path):
+        """Persona with system.jinja2 (no system_prompt.md) loads correctly."""
+        from core.persona import load
+        pd = tmp_path / "jbot"
+        pd.mkdir()
+        (pd / "system.jinja2").write_text("You are {{ name }}.", encoding="utf-8")
+        p = load(pd)
+        assert "{{ name }}" in p.system_prompt
+
+
+class TestMemoryPerPersona:
+    """L2 episodic memory is isolated per persona_id."""
+
+    def test_episodes_isolated_between_personas(self, tmp_path):
+        """Episodes written for 'xiaolin' are not visible to 'assistant'."""
+        from backend.memory.store import MemoryStore
+        store = MemoryStore(tmp_path / "mem.db")
+
+        store.episode_add("owner", "xiaolin", "conversation", "晓林的私密记忆")
+        store.episode_add("owner", "assistant", "conversation", "助手的日常记忆")
+
+        xl = store.episode_list_recent("owner", "xiaolin", limit=10)
+        ast = store.episode_list_recent("owner", "assistant", limit=10)
+
+        xl_contents = [e.content for e in xl]
+        ast_contents = [e.content for e in ast]
+
+        assert "晓林的私密记忆" in xl_contents
+        assert "助手的日常记忆" not in xl_contents
+        assert "助手的日常记忆" in ast_contents
+        assert "晓林的私密记忆" not in ast_contents
+
+    def test_episode_search_scoped_to_persona(self, tmp_path):
+        """FTS5 search for episodes respects persona boundary."""
+        from backend.memory.store import MemoryStore
+        store = MemoryStore(tmp_path / "mem.db")
+
+        store.episode_add("owner", "xiaolin", "conversation", "晓林喜欢七里香这首歌")
+        store.episode_add("owner", "assistant", "conversation", "助手在聊七里香")
+
+        xl_results = store.episode_search("owner", "xiaolin", "七里香")
+        ast_results = store.episode_search("owner", "assistant", "七里香")
+
+        assert all(e.persona == "xiaolin" for e in xl_results)
+        assert all(e.persona == "assistant" for e in ast_results)
+
+    def test_active_persona_id_in_agent_state(self):
+        """AgentState includes active_persona_id field."""
+        from core.types import AgentState
+        state = AgentState(persona="xiaolin", active_persona_id="xiaolin")
+        assert state.active_persona_id == "xiaolin"
+
+    def test_active_persona_id_defaults_empty(self):
+        """active_persona_id defaults to empty string."""
+        from core.types import AgentState
+        state = AgentState(persona="assistant")
+        assert state.active_persona_id == ""
+
+    def test_make_initial_state_sets_active_persona_id(self):
+        """make_initial_state populates active_persona_id correctly."""
+        from backend.orchestrator.graph import make_initial_state
+        s = make_initial_state(persona="晓林", active_persona_id="xiaolin")
+        assert s["active_persona_id"] == "xiaolin"
+
+    def test_make_initial_state_falls_back_to_persona(self):
+        """When active_persona_id omitted, defaults to persona value."""
+        from backend.orchestrator.graph import make_initial_state
+        s = make_initial_state(persona="assistant")
+        assert s["active_persona_id"] == "assistant"
+
+
+class TestMemoryRouter:
+    """route_memory() sends shared-keyword content to L3, rest to L2."""
+
+    def test_emotion_keyword_routes_to_l3(self):
+        from backend.memory.router import route_memory
+        assert route_memory("今天情绪很不好", "xiaolin") == "L3"
+
+    def test_event_keyword_routes_to_l3(self):
+        from backend.memory.router import route_memory
+        assert route_memory("发生了一件大事", "xiaolin") == "L3"
+
+    def test_preference_keyword_routes_to_l3(self):
+        from backend.memory.router import route_memory
+        assert route_memory("她偏好安静的环境", "assistant") == "L3"
+
+    def test_plain_content_routes_to_l2(self):
+        from backend.memory.router import route_memory
+        assert route_memory("今天天气很好", "xiaolin") == "L2"
+        assert route_memory("帮我搜一首歌", "assistant") == "L2"
+
+    def test_should_consolidate_threshold(self):
+        from backend.memory.router import should_consolidate
+        assert should_consolidate(50) is True
+        assert should_consolidate(49) is False
+        assert should_consolidate(100) is True
+
+    def test_route_memory_persona_independent(self):
+        """Routing result doesn't change based on persona_id."""
+        from backend.memory.router import route_memory
+        assert route_memory("喜欢吃火锅", "xiaolin") == route_memory("喜欢吃火锅", "assistant")
+
+
+class TestDreamAllPersonas:
+    """run_all_dreams iterates all persona directories and consolidates each."""
+
+    @pytest.mark.asyncio
+    async def test_run_all_dreams_returns_per_persona_dict(self, tmp_path):
+        """run_all_dreams calls consolidate for each persona and maps results."""
+        import asyncio
+        from backend.memory.dream import run_all_dreams
+        from backend.memory.store import MemoryStore
+
+        store = MemoryStore(tmp_path / "mem.db")
+
+        # Create two minimal persona dirs
+        for pid in ("p1", "p2"):
+            pd = tmp_path / "personas" / pid
+            pd.mkdir(parents=True)
+            (pd / "system_prompt.md").write_text(f"You are {pid}.", encoding="utf-8")
+            # Add some episodes so consolidation threshold is met with force=True
+            for i in range(3):
+                store.episode_add("owner", pid, "conversation", f"{pid} episode {i}")
+
+        mock_llm = lambda system, user_msg, persona=None: '["item"]'
+
+        result = await run_all_dreams(
+            store, mock_llm, user_id="owner",
+            personas_root=str(tmp_path / "personas"),
+            force=True,
+        )
+
+        assert "p1" in result
+        assert "p2" in result
+        assert isinstance(result["p1"], list)
+        assert isinstance(result["p2"], list)
+
+    @pytest.mark.asyncio
+    async def test_run_all_dreams_empty_dir(self, tmp_path):
+        """run_all_dreams returns {} when no personas exist."""
+        from backend.memory.dream import run_all_dreams
+        from backend.memory.store import MemoryStore
+
+        store = MemoryStore(tmp_path / "mem.db")
+        (tmp_path / "personas").mkdir()
+
+        result = await run_all_dreams(
+            store, lambda s, u, p=None: "[]",
+            personas_root=str(tmp_path / "personas"),
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_run_all_dreams_skips_template(self, tmp_path):
+        """_template directory is not processed as a persona."""
+        from backend.memory.dream import run_all_dreams
+        from backend.memory.store import MemoryStore
+
+        store = MemoryStore(tmp_path / "mem.db")
+        personas = tmp_path / "personas"
+
+        tpl = personas / "_template"
+        tpl.mkdir(parents=True)
+        (tpl / "system_prompt.md").write_text("template", encoding="utf-8")
+
+        real = personas / "mybot"
+        real.mkdir()
+        (real / "system_prompt.md").write_text("mybot", encoding="utf-8")
+
+        result = await run_all_dreams(
+            store, lambda s, u, p=None: "[]",
+            personas_root=str(personas),
+        )
+        assert "_template" not in result
+        assert "mybot" in result
+
+
+# ---------------------------------------------------------------------------
+# P3 — Streaming Voice Pipeline Tests
+# ---------------------------------------------------------------------------
+
+class TestEmotionContext:
+    """Tier 1: EmotionContext dataclass — no I/O needed."""
+
+    def test_emotion_context_fields_exist(self):
+        from core.types import EmotionContext
+        ec = EmotionContext(persona="xiaolin", valence=0.5, arousal=0.3, tone="happy", ts=1.0)
+        assert ec.persona == "xiaolin"
+        assert ec.valence == 0.5
+        assert ec.arousal == 0.3
+        assert ec.tone == "happy"
+        assert ec.ts == 1.0
+
+    def test_valence_range_valid(self):
+        from core.types import EmotionContext
+        ec = EmotionContext(persona="p", valence=-1.0, arousal=0.0, tone="sad", ts=0.0)
+        assert -1.0 <= ec.valence <= 1.0
+
+    def test_arousal_range_valid(self):
+        from core.types import EmotionContext
+        ec = EmotionContext(persona="p", valence=0.0, arousal=1.0, tone="excited", ts=0.0)
+        assert 0.0 <= ec.arousal <= 1.0
+
+    def test_tone_is_string(self):
+        from core.types import EmotionContext
+        ec = EmotionContext(persona="p", valence=0.0, arousal=0.5, tone="neutral", ts=0.0)
+        assert isinstance(ec.tone, str)
+
+    def test_default_ts_is_float(self):
+        from core.types import EmotionContext
+        ec = EmotionContext(persona="p", valence=0.0, arousal=0.5, tone="neutral")
+        assert isinstance(ec.ts, float)
+        assert ec.ts > 0
+
+
+class TestEmotionExtractor:
+    """Tier 3 (async): EmotionExtractor stub — no hardware needed."""
+
+    @pytest.mark.asyncio
+    async def test_extract_returns_emotion_context(self):
+        from edge.emotion import EmotionExtractor
+        from core.types import EmotionContext
+        extractor = EmotionExtractor()
+        result = await extractor.extract(b"\x00" * 1024)
+        assert isinstance(result, EmotionContext)
+
+    @pytest.mark.asyncio
+    async def test_extract_tone_is_neutral_stub(self):
+        from edge.emotion import EmotionExtractor
+        extractor = EmotionExtractor()
+        result = await extractor.extract(b"\x00" * 64)
+        assert result.tone == "neutral"
+
+    @pytest.mark.asyncio
+    async def test_extract_stream(self):
+        from edge.emotion import EmotionExtractor
+        from core.types import EmotionContext
+
+        async def fake_audio():
+            for _ in range(3):
+                yield b"\x00" * 256
+
+        extractor = EmotionExtractor()
+        result = await extractor.extract_stream(fake_audio())
+        assert isinstance(result, EmotionContext)
+
+
+class TestLLMStream:
+    """Tier 1/3: create_llm_stream factory — mocked, no API key needed."""
+
+    def test_create_llm_stream_importable(self):
+        from backend.litellm.client import create_llm_stream
+        assert callable(create_llm_stream)
+
+    def test_create_llm_stream_returns_callable(self, monkeypatch):
+        import yaml
+        from pathlib import Path
+        monkeypatch.setattr(
+            "backend.litellm.client._ROUTER_CONFIG",
+            {"model_list": [{"model_name": "default_fast", "litellm_params": {
+                "model": "gpt-4o-mini", "api_base": "", "api_key": ""
+            }, "temperature": 0.7, "max_input": 8000, "max_output": 2000}]},
+        )
+        from backend.litellm.client import create_llm_stream
+        fn = create_llm_stream("default_fast")
+        assert callable(fn)
+
+    @pytest.mark.asyncio
+    async def test_llm_stream_yields_tokens(self, monkeypatch):
+        """Mock litellm to yield chunks; verify stream collects them."""
+        monkeypatch.setattr(
+            "backend.litellm.client._ROUTER_CONFIG",
+            {"model_list": [{"model_name": "default_fast", "litellm_params": {
+                "model": "gpt-4o-mini", "api_base": "https://aihubmix.com", "api_key": "k"
+            }, "temperature": 0.7, "max_input": 8000, "max_output": 2000}]},
+        )
+
+        class _FakeDelta:
+            def __init__(self, c): self.content = c
+        class _FakeChoice:
+            def __init__(self, c): self.delta = _FakeDelta(c)
+        class _FakeChunk:
+            def __init__(self, c): self.choices = [_FakeChoice(c)]
+
+        def _fake_completion(**kwargs):
+            return iter([_FakeChunk("Hello"), _FakeChunk(" world"), _FakeChunk("")])
+
+        import asyncio
+        monkeypatch.setattr("asyncio.to_thread", lambda fn: asyncio.coroutine(fn)())
+
+        import backend.litellm.client as lc
+        original_to_thread = asyncio.to_thread
+
+        async def mock_to_thread(fn):
+            return fn()
+
+        monkeypatch.setattr(asyncio, "to_thread", mock_to_thread)
+
+        import litellm as _ll
+        monkeypatch.setattr(_ll, "completion", _fake_completion)
+
+        from backend.litellm.client import create_llm_stream
+        fn = create_llm_stream("default_fast")
+        tokens = []
+        async for tok in fn("sys", "hi"):
+            tokens.append(tok)
+
+        assert tokens == ["Hello", " world"]
+
+    @pytest.mark.asyncio
+    async def test_llm_stream_skips_empty_delta(self, monkeypatch):
+        """Empty/None deltas must not be yielded."""
+        monkeypatch.setattr(
+            "backend.litellm.client._ROUTER_CONFIG",
+            {"model_list": [{"model_name": "default_fast", "litellm_params": {
+                "model": "gpt-4o-mini", "api_base": "https://aihubmix.com", "api_key": "k"
+            }, "temperature": 0.7, "max_input": 8000, "max_output": 2000}]},
+        )
+
+        class _FakeDelta:
+            def __init__(self, c): self.content = c
+        class _FakeChoice:
+            def __init__(self, c): self.delta = _FakeDelta(c)
+        class _FakeChunk:
+            def __init__(self, c): self.choices = [_FakeChoice(c)]
+
+        import asyncio
+        import litellm as _ll
+        monkeypatch.setattr(_ll, "completion", lambda **kw: iter([
+            _FakeChunk(None), _FakeChunk(""), _FakeChunk("ok"),
+        ]))
+
+        async def mock_to_thread(fn):
+            return fn()
+        monkeypatch.setattr(asyncio, "to_thread", mock_to_thread)
+
+        from backend.litellm.client import create_llm_stream
+        fn = create_llm_stream("default_fast")
+        tokens = [t async for t in fn("sys", "hi")]
+        assert tokens == ["ok"]
+
+
+class TestTTSStream:
+    """Tier 3 (async): synthesize_stream — mocked aiohttp, no network."""
+
+    def test_synthesize_stream_method_exists(self):
+        from backend.tts.cosyvoice_client import CosyVoiceClient
+        assert hasattr(CosyVoiceClient, "synthesize_stream")
+
+    @pytest.mark.asyncio
+    async def test_synthesize_stream_fallback_yields_whole_audio(self, monkeypatch):
+        """Without self_hosted_url, fallback calls synthesize() and yields once."""
+        from backend.tts.cosyvoice_client import CosyVoiceClient
+
+        client = CosyVoiceClient(dashscope_api_key=None, self_hosted_url=None)
+
+        async def fake_synthesize(text, voice_ref=None):
+            return b"AUDIO"
+
+        monkeypatch.setattr(client, "synthesize", fake_synthesize)
+
+        chunks = [c async for c in client.synthesize_stream("hello")]
+        assert chunks == [b"AUDIO"]
+
+    @pytest.mark.asyncio
+    async def test_synthesize_stream_is_async_generator(self):
+        import inspect
+        from backend.tts.cosyvoice_client import CosyVoiceClient
+        client = CosyVoiceClient(dashscope_api_key=None)
+
+        async def fake_synthesize(text, voice_ref=None):
+            return b"X"
+
+        client.synthesize = fake_synthesize  # type: ignore
+        gen = client.synthesize_stream("test")
+        assert hasattr(gen, "__aiter__") and hasattr(gen, "__anext__")
+
+    @pytest.mark.asyncio
+    async def test_synthesize_stream_self_hosted_error_falls_back(self, monkeypatch):
+        """If self-hosted stream fails, fallback to full synthesize()."""
+        from backend.tts.cosyvoice_client import CosyVoiceClient
+
+        client = CosyVoiceClient(dashscope_api_key=None, self_hosted_url="http://fake")
+
+        async def failing_stream(text, voice_ref=None):
+            raise RuntimeError("server down")
+            yield  # make it a generator
+
+        async def fake_synthesize(text, voice_ref=None):
+            return b"FALLBACK"
+
+        monkeypatch.setattr(client, "_stream_self_hosted", failing_stream)
+        monkeypatch.setattr(client, "synthesize", fake_synthesize)
+
+        chunks = [c async for c in client.synthesize_stream("hello")]
+        assert chunks == [b"FALLBACK"]
+
+
+class TestStreamingPipeline:
+    """Tier 3 (async): run_pipeline with fully mocked STT/LLM/TTS."""
+
+    def test_pipeline_importable(self):
+        from backend.streaming.pipeline import run_pipeline, PipelineResult
+        assert callable(run_pipeline)
+        assert PipelineResult  # class exists
+
+    def test_pipeline_result_fields(self):
+        from backend.streaming.pipeline import PipelineResult
+        r = PipelineResult(full_transcript="hi", full_response="hello", latencies={"t_total": 0.1})
+        assert r.full_transcript == "hi"
+        assert r.full_response == "hello"
+        assert "t_total" in r.latencies
+
+    @pytest.mark.asyncio
+    async def test_pipeline_end_to_end_mock(self):
+        """Full pipeline with stub STT, echo LLM, stub TTS."""
+        from backend.streaming.pipeline import run_pipeline
+
+        async def fake_audio():
+            yield b"\x00" * 256
+
+        async def mock_llm_stream(system, user_msg, persona=None):
+            yield "mocked "
+            yield "response"
+
+        async def mock_tts_stream(text, voice_ref=None):
+            yield b"AUDIO:" + text.encode()
+
+        audio_received: list[bytes] = []
+
+        async def on_audio(chunk: bytes) -> None:
+            audio_received.append(chunk)
+
+        result = await run_pipeline(
+            audio_stream=fake_audio(),
+            persona_id="test",
+            llm_stream_fn=mock_llm_stream,
+            tts_stream_fn=mock_tts_stream,
+            on_audio=on_audio,
+        )
+
+        assert result.full_response == "mocked response"
+        assert len(audio_received) > 0
+        assert b"mocked response" in audio_received[0]
+
+    @pytest.mark.asyncio
+    async def test_pipeline_latency_keys_present(self):
+        """PipelineResult.latencies must contain t_total and t_stt_first."""
+        from backend.streaming.pipeline import run_pipeline
+
+        async def fake_audio():
+            yield b"\x00" * 64
+
+        async def mock_llm(system, user_msg, persona=None):
+            yield "ok"
+
+        async def mock_tts(text, voice_ref=None):
+            yield b"audio"
+
+        async def on_audio(chunk): pass
+
+        result = await run_pipeline(
+            audio_stream=fake_audio(),
+            persona_id="p",
+            llm_stream_fn=mock_llm,
+            tts_stream_fn=mock_tts,
+            on_audio=on_audio,
+        )
+        assert "t_total" in result.latencies
+        assert "t_stt_first" in result.latencies
+
+    @pytest.mark.asyncio
+    async def test_pipeline_on_audio_called(self):
+        """on_audio callback must be invoked at least once."""
+        from backend.streaming.pipeline import run_pipeline
+
+        call_count = 0
+
+        async def fake_audio():
+            yield b"\x00" * 64
+
+        async def mock_llm(system, user_msg, persona=None):
+            yield "text"
+
+        async def mock_tts(text, voice_ref=None):
+            yield b"chunk1"
+            yield b"chunk2"
+
+        async def on_audio(chunk):
+            nonlocal call_count
+            call_count += 1
+
+        await run_pipeline(
+            audio_stream=fake_audio(),
+            persona_id="p",
+            llm_stream_fn=mock_llm,
+            tts_stream_fn=mock_tts,
+            on_audio=on_audio,
+        )
+        assert call_count >= 1
+
+
+# ===========================================================================
+# P4: Proactive Perception
+# ===========================================================================
+
+
+class TestProactiveEvent:
+    """Tier 1: ProactiveEvent dataclass."""
+
+    def test_proactive_event_fields_exist(self):
+        from core.types import ProactiveEvent
+        ev = ProactiveEvent(
+            trigger="emotion_trend",
+            persona="xiaolin",
+            user_id="owner",
+            message="你好吗？",
+        )
+        assert ev.trigger == "emotion_trend"
+        assert ev.persona == "xiaolin"
+        assert ev.user_id == "owner"
+        assert ev.message == "你好吗？"
+        assert ev.priority == 1
+        assert isinstance(ev.ts, float)
+        assert isinstance(ev.metadata, dict)
+
+    def test_proactive_event_defaults(self):
+        from core.types import ProactiveEvent
+        ev = ProactiveEvent(trigger="home_arrival", persona="p", user_id="u", message="hi")
+        assert ev.priority == 1
+        assert ev.metadata == {}
+        assert ev.ts > 0
+
+    def test_proactive_event_slots(self):
+        from core.types import ProactiveEvent
+        ev = ProactiveEvent(trigger="t", persona="p", user_id="u", message="m")
+        with pytest.raises(AttributeError):
+            ev.nonexistent_field = "x"  # type: ignore[attr-defined]
+
+    def test_proactive_event_trigger_strings(self):
+        from core.types import ProactiveEvent
+        for trigger in ("emotion_trend", "topic_followup", "home_arrival"):
+            ev = ProactiveEvent(trigger=trigger, persona="p", user_id="u", message="m")
+            assert ev.trigger == trigger
+
+
+class TestQueryEmotionTrend:
+    """Tier 2: MemoryStore.query_emotion_trend()."""
+
+    def test_returns_empty_when_no_dreams(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        store = MemoryStore(tmp_path / "mem.db")
+        assert store.query_emotion_trend("owner", "assistant", days=7) == []
+
+    def test_filters_out_positive_dreams(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        store = MemoryStore(tmp_path / "mem.db")
+        store.dream_add("owner", "assistant", "events", "今天很开心，一切都很顺利！")
+        assert store.query_emotion_trend("owner", "assistant", days=7) == []
+
+    def test_returns_negative_dreams(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        store = MemoryStore(tmp_path / "mem.db")
+        store.dream_add("owner", "assistant", "events", "最近感觉很焦虑，工作压力很大")
+        result = store.query_emotion_trend("owner", "assistant", days=7)
+        assert len(result) == 1
+        assert "焦虑" in result[0].summary
+
+    def test_respects_days_window(self, tmp_path):
+        import time
+        from backend.memory.store import MemoryStore
+        store = MemoryStore(tmp_path / "mem.db")
+        old_ts = time.time() - 10 * 86400
+        with store._lock:
+            with store._get_connection() as conn:
+                conn.execute(
+                    "INSERT INTO dreams (user_id, persona, timestamp, category, summary, "
+                    "source_episode_ids_json, quality_score, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    ("owner", "assistant", old_ts, "events", "难过伤心", "[]", 0.0, old_ts),
+                )
+                conn.commit()
+        # Only last 7 days — 10-day-old dream must not appear
+        assert store.query_emotion_trend("owner", "assistant", days=7) == []
+
+    def test_cross_user_isolation(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        store = MemoryStore(tmp_path / "mem.db")
+        store.dream_add("other_user", "assistant", "events", "我好焦虑啊")
+        assert store.query_emotion_trend("owner", "assistant", days=7) == []
+
+
+class TestProactiveTriggers:
+    """Tier 1/2: individual trigger functions."""
+
+    def test_emotion_trend_none_on_short_streak(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        from backend.proactive.triggers import check_emotion_trend
+        store = MemoryStore(tmp_path / "mem.db")
+        store.dream_add("owner", "assistant", "events", "今天有点难过")
+        result = check_emotion_trend(store, "owner", "assistant", streak_required=3)
+        assert result is None
+
+    def test_emotion_trend_fires_on_full_streak(self, tmp_path):
+        import time
+        from backend.memory.store import MemoryStore
+        from backend.proactive.triggers import check_emotion_trend
+        store = MemoryStore(tmp_path / "mem.db")
+        # Insert a negative dream on each of 3 consecutive days
+        for days_ago in (0, 1, 2):
+            ts = time.time() - days_ago * 86400
+            with store._lock:
+                with store._get_connection() as conn:
+                    conn.execute(
+                        "INSERT INTO dreams (user_id, persona, timestamp, category, summary, "
+                        "source_episode_ids_json, quality_score, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                        ("owner", "assistant", ts, "events", "感觉很焦虑", "[]", 0.0, ts),
+                    )
+                    conn.commit()
+        ev = check_emotion_trend(store, "owner", "assistant", streak_required=3)
+        assert ev is not None
+        assert ev.trigger == "emotion_trend"
+        assert ev.priority == 3
+        assert ev.metadata["streak_days"] == 3
+
+    def test_topic_followup_no_event_fresh_topic(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        from backend.proactive.triggers import check_topic_followup
+        store = MemoryStore(tmp_path / "mem.db")
+        store.episode_add("owner", "assistant", "conversation", "interview went well today")
+        events = check_topic_followup(
+            store, "owner", "assistant", ["interview"], stale_after_days=3
+        )
+        assert events == []
+
+    def test_topic_followup_fires_stale_topic(self, tmp_path):
+        import time
+        from backend.memory.store import MemoryStore
+        from backend.proactive.triggers import check_topic_followup
+        store = MemoryStore(tmp_path / "mem.db")
+        old_ts = time.time() - 4 * 86400
+        with store._lock:
+            with store._get_connection() as conn:
+                conn.execute(
+                    "INSERT INTO episodes (user_id, persona, timestamp, event_type, content, "
+                    "metadata_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                    ("owner", "assistant", old_ts, "conversation", "project update", "{}", old_ts),
+                )
+                conn.commit()
+        events = check_topic_followup(
+            store, "owner", "assistant", ["project"], stale_after_days=3
+        )
+        assert len(events) == 1
+        assert events[0].trigger == "topic_followup"
+        assert events[0].priority == 2
+        assert events[0].metadata["last_seen_days"] >= 3.9
+
+    def test_topic_followup_empty_when_topic_unknown(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        from backend.proactive.triggers import check_topic_followup
+        store = MemoryStore(tmp_path / "mem.db")
+        events = check_topic_followup(
+            store, "owner", "assistant", ["exam"], stale_after_days=3
+        )
+        assert events == []
+
+    def test_home_arrival_fires_above_threshold(self):
+        from backend.proactive.triggers import check_home_arrival
+        ev = check_home_arrival(confidence=0.9, user_id="owner", persona="xiaolin")
+        assert ev is not None
+        assert ev.trigger == "home_arrival"
+        assert ev.priority == 3
+        assert ev.metadata["confidence"] == pytest.approx(0.9)
+
+    def test_home_arrival_none_below_threshold(self):
+        from backend.proactive.triggers import check_home_arrival
+        ev = check_home_arrival(confidence=0.5, user_id="owner", persona="xiaolin")
+        assert ev is None
+
+
+class TestFaceGateArrival:
+    """Tier 1: FaceGate on_arrival callback wiring."""
+
+    def test_face_gate_accepts_on_arrival_kwarg(self):
+        from edge.face_gate import FaceGate
+        gate = FaceGate(on_arrival=lambda owner_id, conf: None)
+        assert gate.on_arrival is not None
+
+    @pytest.mark.asyncio
+    async def test_verify_calls_callback_sync(self):
+        from edge.face_gate import FaceGate
+        calls: list[tuple] = []
+        gate = FaceGate(on_arrival=lambda owner_id, conf: calls.append((owner_id, conf)))
+        gate.face_recognizer = "stub"   # bypass None guard
+        gate.owner_embedding = [0.5]   # bypass None guard
+        result = await gate.verify(b"fake_image")
+        assert result["verified"] is True
+        assert len(calls) == 1
+        assert calls[0][0] == "owner"
+        assert calls[0][1] == pytest.approx(0.95)
+
+    @pytest.mark.asyncio
+    async def test_verify_no_callback_when_none(self):
+        from edge.face_gate import FaceGate
+        gate = FaceGate()   # on_arrival=None by default
+        gate.face_recognizer = "stub"
+        gate.owner_embedding = [0.5]
+        result = await gate.verify(b"img")
+        assert result["verified"] is True  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_proactive_scan_returns_list(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        from backend.proactive.scanner import proactive_scan
+        store = MemoryStore(tmp_path / "scan.db")
+        events = await proactive_scan(store, "owner", "assistant", tracked_topics=[])
+        assert isinstance(events, list)
+
+
+class TestPersonaPack:
+    """Tier 1: Persona pack / install / validate CLI tool."""
+
+    def test_pack_creates_file(self, tmp_path):
+        from tools.persona_pack import pack
+        xiaolin = PROJECT_ROOT / "personas" / "xiaolin"
+        out = pack(xiaolin, tmp_path / "xiaolin.persona")
+        assert out.exists()
+        assert out.suffix == ".persona"
+
+    def test_pack_zip_contains_required_files(self, tmp_path):
+        import zipfile
+        from tools.persona_pack import pack
+        out = pack(PROJECT_ROOT / "personas" / "xiaolin", tmp_path / "xiaolin.persona")
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+        assert "persona.yaml" in names
+        assert any(f in names for f in ("system.jinja2", "system_prompt.md"))
+
+    def test_pack_includes_voices_dir(self, tmp_path):
+        import zipfile
+        from tools.persona_pack import pack
+        out = pack(PROJECT_ROOT / "personas" / "xiaolin", tmp_path / "xiaolin.persona")
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+        assert any("voices" in n for n in names)
+
+    def test_validate_valid_zip_passes(self, tmp_path):
+        from tools.persona_pack import pack, validate_zip
+        out = pack(PROJECT_ROOT / "personas" / "xiaolin", tmp_path / "xiaolin.persona")
+        result = validate_zip(out)
+        assert result.ok
+        assert result.errors == []
+
+    def test_validate_missing_persona_yaml_fails(self, tmp_path):
+        import zipfile
+        from tools.persona_pack import validate_zip
+        bad = tmp_path / "bad.persona"
+        with zipfile.ZipFile(bad, "w") as zf:
+            zf.writestr("system.jinja2", "你好 {{ user_id }}")
+        result = validate_zip(bad)
+        assert not result.ok
+        assert any("persona.yaml" in e for e in result.errors)
+
+    def test_validate_missing_system_prompt_fails(self, tmp_path):
+        import zipfile
+        import yaml
+        from tools.persona_pack import validate_zip
+        bad = tmp_path / "bad.persona"
+        with zipfile.ZipFile(bad, "w") as zf:
+            zf.writestr("persona.yaml", yaml.dump({"name": "test", "wake_word": "test"}))
+        result = validate_zip(bad)
+        assert not result.ok
+        assert any("system prompt" in e.lower() or "system.jinja2" in e for e in result.errors)
+
+    def test_validate_malformed_yaml_fails(self, tmp_path):
+        import zipfile
+        from tools.persona_pack import validate_zip
+        bad = tmp_path / "bad.persona"
+        with zipfile.ZipFile(bad, "w") as zf:
+            zf.writestr("persona.yaml", ": invalid: {{{")
+            zf.writestr("system.jinja2", "hello")
+        result = validate_zip(bad)
+        assert not result.ok
+        assert any("parse error" in e.lower() or "yaml" in e.lower() for e in result.errors)
+
+    def test_install_roundtrip(self, tmp_path):
+        from tools.persona_pack import pack, install
+        from core.persona import load
+        out = pack(PROJECT_ROOT / "personas" / "xiaolin", tmp_path / "xiaolin.persona")
+        installed = install(out, target=tmp_path / "personas")
+        p = load(installed)
+        assert p.wake_word == "晓林"
+        assert "晓林" in p.system_prompt
+
+    def test_install_force_overwrites(self, tmp_path):
+        from tools.persona_pack import pack, install
+        out = pack(PROJECT_ROOT / "personas" / "xiaolin", tmp_path / "xiaolin.persona")
+        target = tmp_path / "personas"
+        install(out, target=target)
+        with pytest.raises(FileExistsError):
+            install(out, target=target)
+        installed = install(out, target=target, force=True)
+        assert installed.exists()
+
+    def test_export_alias(self, tmp_path):
+        from tools.persona_pack import pack, export
+        xiaolin = PROJECT_ROOT / "personas" / "xiaolin"
+        out_pack = pack(xiaolin, tmp_path / "via_pack.persona")
+        out_export = export(xiaolin, tmp_path / "via_export.persona")
+        assert out_pack.stat().st_size == out_export.stat().st_size

@@ -17,7 +17,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-__all__ = ["DreamWorker"]
+__all__ = ["DreamWorker", "run_all_dreams"]
 
 logger = logging.getLogger(__name__)
 
@@ -223,3 +223,34 @@ Extract key {category} as a concise JSON list. Be brief. Return ONLY valid JSON.
         if new_quality_score is not None:
             self.store.dream_update_quality(dream_id, new_quality_score)
             logger.info(f"Dream {dream_id} quality updated to {new_quality_score:.2f}")
+
+
+async def run_all_dreams(
+    store: Any,
+    llm_call_func: Any,
+    user_id: str = "owner",
+    personas_root: str = "personas",
+    *,
+    force: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
+    """Nightly dream consolidation for every known persona.
+
+    Iterates all persona directories, runs L2→L3 consolidation for each,
+    and returns a mapping of persona_id → list of created dream dicts.
+    """
+    from pathlib import Path
+    from core.persona import list_personas
+
+    results: dict[str, list[dict[str, Any]]] = {}
+    worker = DreamWorker(store=store, llm_call_func=llm_call_func)
+
+    for persona_id in list_personas(Path(personas_root)):
+        try:
+            dreams = await worker.consolidate(user_id, persona_id, force=force)
+            results[persona_id] = dreams
+            logger.info(f"run_all_dreams: {persona_id} → {len(dreams)} dream(s)")
+        except Exception as e:
+            logger.error(f"run_all_dreams: {persona_id} failed: {e}")
+            results[persona_id] = []
+
+    return results

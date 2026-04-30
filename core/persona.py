@@ -10,6 +10,7 @@ import yaml
 @dataclass(slots=True)
 class Persona:
     name: str
+    wake_word: str  # 唤醒词文本，等于人格名字；用于 wake event routing
     system_prompt: str
     voice_ref_path: Path | None
     voice_ref_text: str
@@ -27,12 +28,27 @@ def load(persona_dir: Path) -> Persona:
         raise FileNotFoundError(f"persona dir missing: {persona_dir}")
 
     name = persona_dir.name
-    sp_path = persona_dir / "system_prompt.md"
-    if not sp_path.exists():
-        raise FileNotFoundError(f"{name}: system_prompt.md required")
-    system_prompt = sp_path.read_text(encoding="utf-8")
 
-    voice_ref = persona_dir / "voice_ref.wav"
+    # 读取 persona.yaml（可选），提取 wake_word 和 display name
+    persona_yaml_path = persona_dir / "persona.yaml"
+    persona_meta: dict = {}
+    if persona_yaml_path.exists():
+        persona_meta = yaml.safe_load(persona_yaml_path.read_text(encoding="utf-8")) or {}
+    wake_word: str = persona_meta.get("wake_word") or persona_meta.get("name") or name
+
+    sp_path = persona_dir / "system_prompt.md"
+    # 也支持 system.jinja2 作为 system prompt（P2 新格式）
+    jinja_path = persona_dir / "system.jinja2"
+    if sp_path.exists():
+        system_prompt = sp_path.read_text(encoding="utf-8")
+    elif jinja_path.exists():
+        system_prompt = jinja_path.read_text(encoding="utf-8")
+    else:
+        raise FileNotFoundError(f"{name}: system_prompt.md or system.jinja2 required")
+
+    voice_ref = persona_dir / "voices" / "ref.wav"
+    if not voice_ref.exists():
+        voice_ref = persona_dir / "voice_ref.wav"
     voice_ref_path = voice_ref if voice_ref.exists() else None
     vr_txt = persona_dir / "voice_ref.txt"
     voice_ref_text = vr_txt.read_text(encoding="utf-8").strip() if vr_txt.exists() else ""
@@ -54,6 +70,7 @@ def load(persona_dir: Path) -> Persona:
 
     return Persona(
         name=name,
+        wake_word=wake_word,
         system_prompt=system_prompt,
         voice_ref_path=voice_ref_path,
         voice_ref_text=voice_ref_text,

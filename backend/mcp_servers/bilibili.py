@@ -78,6 +78,15 @@ class BilibiliServer:
             dedeuserid=data["dedeuserid"],
         )
 
+    _EXPIRY_KEYWORDS = ("401", "403", "invalid credential", "not logged in", "sessdata")
+
+    def _check_expiry(self, exc: Exception) -> None:
+        """Mark unauthenticated if the exception looks like a credential expiry."""
+        err = repr(exc).lower()
+        if any(k in err for k in self._EXPIRY_KEYWORDS):
+            self.authenticated = False
+            logger.warning("Bilibili credential expired — marking unauthenticated")
+
     async def get_live_chat(self, room_id: int, limit: int = 10) -> list[dict[str, Any]]:
         """Fetch recent messages from a live room.
 
@@ -101,6 +110,7 @@ class BilibiliServer:
                 for msg in (history.get("admin", []) + history.get("room", []))[:limit]
             ]
         except Exception as e:
+            self._check_expiry(e)
             logger.warning(f"get_live_chat({room_id}) failed: {e!r}")
             return []
 
@@ -115,6 +125,7 @@ class BilibiliServer:
             await room.send_danmaku(live.Danmaku(text=message))
             return True
         except Exception as e:
+            self._check_expiry(e)
             logger.warning(f"send_message({room_id}) failed: {e!r}")
             return False
 
@@ -135,5 +146,6 @@ class BilibiliServer:
                 "online": base.get("online", 0),
             }
         except Exception as e:
+            self._check_expiry(e)
             logger.warning(f"get_room_info({room_id}) failed: {e!r}")
             return {"room_id": room_id, "title": "", "live_status": 0, "online": 0}

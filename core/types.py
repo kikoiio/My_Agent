@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -46,6 +47,26 @@ class Message(BaseModel):
     tool_call_id: str | None = None
 
 
+@dataclass(slots=True)
+class EmotionContext:
+    persona: str
+    valence: float   # -1.0 (negative) → 1.0 (positive)
+    arousal: float   # 0.0 (calm) → 1.0 (excited)
+    tone: str        # "neutral" | "happy" | "sad" | "anxious" | "excited"
+    ts: float = field(default_factory=time.time)
+
+
+@dataclass(slots=True)
+class ProactiveEvent:
+    trigger: str    # "emotion_trend" | "topic_followup" | "home_arrival"
+    persona: str
+    user_id: str
+    message: str    # ready-to-speak opening line
+    priority: int = 1   # 1=low, 2=medium, 3=high
+    ts: float = field(default_factory=time.time)
+    metadata: dict = field(default_factory=dict)
+
+
 class AgentState(BaseModel):
     """Per-turn state passed through the LangGraph main graph.
 
@@ -57,6 +78,7 @@ class AgentState(BaseModel):
 
     user_id: str = "owner"
     persona: str
+    active_persona_id: str = ""  # persona 目录名，用于 L2 记忆路由
     messages: list[Message] = Field(default_factory=list)
     role: Literal["chat", "dream", "memory_writer"] = "chat"
     has_image: bool = False

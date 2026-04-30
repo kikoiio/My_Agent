@@ -1,194 +1,130 @@
-# My_agent — Pi 4B 24/7 多人格语音 Agent
+# My Agent — 本地语音 AI 伴侣
 
-完整设计见 [plan.md](plan.md)；当前实施进度见 [process.md](process.md)。
+[![Tests](https://img.shields.io/badge/tests-257%20passing-brightgreen)](tests/smoke_test.py)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 
-## 当前状态
+本地优先、可自托管的多人格语音 AI 伴侣。每个人格是一位有独立名字、声音、性格和私人记忆的**朋友**。呼名触发，支持工具调用（B 站、网易云、日历、网页搜索），记忆持久化。无需云端依赖，单机运行。
 
-8 个 batch 全部完成（88 文件），核心逻辑已通过 160 项冒烟测试。**尚未可端到端运行（需要 LLM API 密钥 + 树莓派硬件）。**
-
-## 项目布局
-
-详见 plan.md §13。本仓库已创建：
-
-- `core/` — 平台无关核心（types、persona、router、breaker、HAL 接口）
-- `core/hardware/` — HAL 抽象 + Null/Mock 实现
-- `personas/_template/` — 人格 5 件套模板
-- `data/` — 运行时 SQLite（不入库）
-- `eval/fixtures/` — Mock HAL fixture（待填）
-
-## 用户必填项
-
-详见 plan.md 附录 A，关键项：
-
-- LLM 提供商 API keys → `backend/secrets/llm_keys.env`
-- 人格定义 → `personas/<Name>/{system_prompt.md, voice_ref.wav, voice_ref.txt, wake.onnx, tools.yaml}`
-- 主人录入 → `python scripts/enroll_owner.py`（待 Batch 7 实现）
-- 网易云 / B 站 / 飞书登录 → `python scripts/*_login.py`（待 Batch 7）
+---
 
 ## 快速开始
 
-### 1. 环境设置（开发机）
+**1. 安装依赖**
 
 ```bash
-# Clone 项目
-cd ~/projects
-git clone https://github.com/your-org/multi-persona-voice-agent.git
+git clone <repo-url>
 cd My_agent
-
-# 创建虚拟环境
-python -m venv .venv
-. .venv/Scripts/activate    # Windows
-# . .venv/bin/activate     # Linux/macOS
-
-# 安装依赖
 pip install -r requirements.txt
 ```
 
-### 2. 配置 LLM 密钥
+**2. 配置密钥**
 
 ```bash
-# 创建密钥文件
-mkdir -p backend/secrets
-cat > backend/secrets/llm_keys.env << EOF
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=...
-COHERE_API_KEY=...
-REPLICATE_API_KEY=...
-EOF
-chmod 600 backend/secrets/llm_keys.env
+cp backend/secrets/llm_keys.env.example backend/secrets/llm_keys.env
+# 填入 AIHUBMIX_API_KEY（必须）和 NVIDIA_API_KEY（可选）
+
+cp backend/secrets/accounts.env.example backend/secrets/accounts.env
+# 可选：填入 B 站 / 网易云 cookie 以启用媒体工具
 ```
 
-### 3. 创建第一个人格
+**3. 启动 CLI 对话**
 
 ```bash
-# 使用模板创建人格目录
-cp -r personas/_template personas/kobe
-
-# 编辑人格文件（示例）
-echo "你是 NBA 传奇球星 Kobe Bryant。" > personas/kobe/system_prompt.md
-echo "Kobe 说话像 Kobe" > personas/kobe/voice_ref.txt
+python main.py                      # 默认人格（小安）
+python main.py --persona xiaolin    # 切换到晓林人格
 ```
 
-### 4. 运行评测（可选）
+**4. 运行测试**
 
 ```bash
-# 运行测试用例
-pytest eval/runners/harness.py -v
-
-# 生成报告
-python eval/runners/reporter.py --output eval_report.html
+python -m pytest tests/smoke_test.py -v   # 257 个测试，全绿
 ```
 
-### 5. 部署到树莓派
+**5. Docker 部署（可选）**
 
 ```bash
-# 在树莓派上检查硬件
-bash deploy/check_hardware.sh
-
-# 安装 edge runtime
-bash deploy/wireguard/setup.sh raspberrypi 192.168.1.100
-
-# 启动 edge service
-sudo systemctl start edge-runtime
-sudo systemctl status edge-runtime
+docker compose -f deploy/docker-compose.yml up -d
 ```
 
-### 6. 注册主人（Pi 上）
+---
+
+## 架构
+
+```
+单机（游戏本 / 台式机）
+  edge/                          backend/
+    wakeword.py  ← 呼名触发         orchestrator/graph.py  ← LangGraph draft→critic→respond
+    face_gate.py ← 人脸识别         litellm/client.py      ← 模型路由（AIHubMix）
+    emotion.py   ← 声学特征         memory/store.py        ← 3 层 SQLite 记忆
+         │                          security/guard.py      ← 注入防御 + 频率限制
+         │  进程内直接调用           mcp_servers/           ← 7 个工具（B 站/网易云/日历/搜索…）
+         └──────────────────────    proactive/scanner.py   ← 主动感知（5 分钟扫描）
+                core/ (shared types, persona loading, circuit breaker)
+                personas/ (人格定义：assistant / xiaolin / 你自己的…)
+                tools/ (persona_pack.py — 人格打包 / 安装 / 验证)
+```
+
+**数据流：** 语音 → openWakeWord（人格名触发）→ Whisper STT → LangGraph → LiteLLM → CosyVoice TTS → 音箱。
+
+**记忆层：**
+- L1（全局）：系统级上下文，永久保留
+- L2（人格私有）：每个人格与用户的情节记忆，按 `persona_id` 隔离
+- L3（全局语义）：Dream 异步蒸馏 L2→L3，所有人格共享
+
+---
+
+## 人格系统
+
+每个人格是 `personas/<name>/` 目录下的一组文件：
+
+| 文件 | 作用 |
+|------|------|
+| `persona.yaml` | 名字、唤醒词、简介 |
+| `system.jinja2` 或 `system_prompt.md` | 性格、说话方式、禁忌 |
+| `voices/ref.wav` | CosyVoice 零样本声音克隆参考音 |
+| `tools.yaml` | 工具白名单 / 黑名单 / 高危验证列表 |
+| `routing.yaml` | 模型路由偏好（可选） |
+| `memory_init.json` | 初始记忆（可选） |
+
+**打包分享：**
 
 ```bash
-# 录入主人人脸和声纹
-python scripts/enroll_owner.py --owner-id owner
-
-# 训练唤醒词
-python scripts/wakeword_train.py kobe --samples 30
-
-# 测试语音合成
-python scripts/test_persona_voice.py kobe --text "你好，我是 Kobe"
+python tools/persona_pack.py pack personas/xiaolin    # → xiaolin.persona
+python tools/persona_pack.py install xiaolin.persona  # → 解压到 personas/
+python tools/persona_pack.py validate xiaolin.persona # → 格式检查
 ```
 
-## 开发依赖
+详见 [docs/persona-guide.md](docs/persona-guide.md)。
 
-详见 `requirements.txt`（Batch 1 基础）。后续 batch 会按需追加：
+---
 
-- **Batch 2**: fastapi（看板）
-- **Batch 3**: pytest, deepeval, jinja2, litellm
-- **Batch 4**: dashscope, pyncm, bilibili-api, browser-use
-- **Batch 5**: pipecat, langgraph, langchain
-- **Batch 6**: picamera2, sherpa-onnx, openwakeword, insightface, onnxruntime
+## 工具列表
 
-## 架构概览
+| 工具组 | 功能 |
+|--------|------|
+| `bilibili_*` | 查直播间信息、拉弹幕快照 |
+| `pyncm_*` | 网易云搜歌、查歌单、获取播放列表 |
+| `caldav_*` | 日历事件查询 / 创建 / 删除 |
+| `bocha_*` | 网页搜索、新闻搜索、图片搜索 |
+| `memory_*` | 记忆召回、写入、摘要 |
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                   Backend (游戏本)                        │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────────────┐ │
-│  │ LangGraph│  │ Pipecat  │  │ Memory Store (SQLite)  │ │
-│  │  draft   │  │ Pipeline │  │ L1/L2/L3 (dream)       │ │
-│  │ ↓ critic │  │ STT→LLM  │  │ Tracer (observability) │ │
-│  │ ↓respond │  │ →TTS     │  └────────────────────────┘ │
-│  └──────────┘  └──────────┘           ↕                  │
-│       ↑              ↑                  │                 │
-│       ├──────────────┴──────────────────┤                 │
-│       │         WebSocket Tunnel        │                 │
-│       └────────────────┬─────────────────┘                 │
-└─────────────────────────────────────────────────────────┘
-                         │
-          ┌──────────────┴──────────────┐
-          │   WireGuard (encrypted)     │
-          │   [10.0.0.2] ← → [10.0.0.1]│
-          └──────────────┬──────────────┘
-                         │
-    ┌────────────────────┴─────────────────────┐
-    │                                          │
-┌───▼────────────────────────────────────────┐│
-│        Edge Runtime (树莓派 4B)            ││
-│  ┌────────────────────────────────────┐  ││
-│  │  Camera (picamera2)                │  ││
-│  │  Face Gate (InsightFace)           │  ││
-│  │  Voice Gate (3D-Speaker)           │  ││
-│  │  Wake Word (OpenWakeWord × N)      │  ││
-│  │  Audio Router (PipeWire + BT)      │  ││
-│  │  STT (Sherpa-ONNX)                 │  ││
-│  └────────────────────────────────────┘  ││
-└────────────────────────────────────────────┘│
-                                              │
-                   USB Camera, Mic, Speaker ──┘
-```
+工具调用经过人格白名单过滤；高危操作（发弹幕、删日历、记忆写入）需主人声纹二次验证。
 
-## 核心概念
+---
 
-- **Persona**：独立的AI人格，有自己的system_prompt、声音、工具权限
-- **Agent Loop**：单轮对话（route → LLM → memory）
-- **LangGraph**：draft→critic→respond三层推理
-- **Memory**：L1(会话)、L2(情景)、L3(梦境/整合)三层记忆
-- **Tracer**：分布式追踪与judge评测
-- **Guard**：安全守卫（注入检测、内容分类）
-- **Hardware Abstraction**：Pi/远程硬件透明切换
+## 评测
 
-## 文件结构
+参见 [eval/report.md](eval/report.md)，涵盖 9 个维度：任务完成、安全防注入、记忆召回、工具调用、人格一致性、情绪感知、流式延迟（存根）、主动感知、语音生物特征。
 
-详见 [process.md](process.md) 和 [plan.md](plan.md) §13。
+---
 
-## 测试
+## 贡献
 
-```bash
-# 运行冒烟测试（无需硬件/API密钥）
-python -m pytest tests/smoke_test.py -v
+欢迎提交工具、人格包、bug 修复，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-# 运行评测用例（需要 LLM 密钥）
-pytest eval/runners/harness.py -v
-
-# 运行特定类别
-pytest tests/smoke_test.py -k "security" -v
-```
-
-## 部署
-
-- **Backend**: Docker Compose（`deploy/docker-compose.yml`）
-- **Edge**: systemd 服务（`deploy/systemd/edge-runtime.service`）
-- **Network**: WireGuard VPN（`deploy/wireguard/setup.sh`）
+---
 
 ## 许可证
 
-（添加你的许可证）
+[Apache 2.0](LICENSE)

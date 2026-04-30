@@ -51,6 +51,15 @@ class PyncmServer:
         session.load(data)
         SetCurrentSession(session)
 
+    _EXPIRY_KEYWORDS = ("401", "403", "need login", "not login", "music_u")
+
+    def _check_expiry(self, exc: Exception) -> None:
+        """Mark unauthenticated if the exception looks like a session expiry."""
+        err = repr(exc).lower()
+        if any(k in err for k in self._EXPIRY_KEYWORDS):
+            self.authenticated = False
+            logger.warning("Pyncm session expired — marking unauthenticated")
+
     async def search_track(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         """Search NCM for tracks. stype=1 = single track."""
         if not self.authenticated:
@@ -70,6 +79,7 @@ class PyncmServer:
                 for s in songs[:limit]
             ]
         except Exception as e:
+            self._check_expiry(e)
             logger.warning(f"search_track({query!r}) failed: {e!r}")
             return []
 
@@ -95,6 +105,7 @@ class PyncmServer:
                 ],
             }
         except Exception as e:
+            self._check_expiry(e)
             logger.warning(f"get_playlist({playlist_id}) failed: {e!r}")
             return {}
 
@@ -111,6 +122,7 @@ class PyncmServer:
                 for p in (data.get("playlist") or [])
             ]
         except Exception as e:
+            self._check_expiry(e)
             logger.warning(f"get_user_playlists({user_id}) failed: {e!r}")
             return []
 

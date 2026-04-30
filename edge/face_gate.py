@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 __all__ = ["FaceGate"]
@@ -17,15 +18,18 @@ class FaceGate:
         self,
         owner_id: str = "owner",
         enrollment_dir: str = "data/enrollments/faces",
+        on_arrival: Callable[[str, float], None] | None = None,
     ):
         """Initialize face gate.
 
         Args:
             owner_id: Owner identifier
             enrollment_dir: Directory with owner face embeddings
+            on_arrival: Optional callback(owner_id, confidence) fired on successful verify
         """
         self.owner_id = owner_id
         self.enrollment_dir = enrollment_dir
+        self.on_arrival = on_arrival
         self.face_recognizer = None
         self.owner_embedding = None
 
@@ -102,11 +106,13 @@ class FaceGate:
             #     "faces_found": len(faces),
             # }
 
-            return {
-                "verified": True,
-                "confidence": 0.95,
-                "faces_found": 1,
-            }
+            result: dict[str, Any] = {"verified": True, "confidence": 0.95, "faces_found": 1}
+            if result["verified"] and self.on_arrival is not None:
+                try:
+                    self.on_arrival(self.owner_id, result["confidence"])
+                except Exception:
+                    logger.warning("on_arrival callback raised")
+            return result
         except Exception as e:
             logger.error(f"Face verification error: {e}")
             return {"verified": False, "confidence": 0.0, "error": str(e)}
