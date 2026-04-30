@@ -57,9 +57,15 @@ class CosyVoiceClient:
             except Exception as e:
                 logger.warning(f"Self-hosted synthesis failed: {e!r}")
 
-        raise RuntimeError(
-            "No available TTS endpoint (DashScope disabled and no self-hosted configured)"
-        )
+        # edge-tts fallback (free, no API key required)
+        try:
+            from backend.tts.edge_tts_client import EdgeTTSClient
+            return await EdgeTTSClient().synthesize(text)
+        except Exception as e:
+            raise RuntimeError(
+                f"All TTS endpoints failed. Last error: {e!r}. "
+                "Install edge-tts (pip install edge-tts) or configure DashScope/self-hosted."
+            ) from e
 
     async def _synthesize_dashscope(self, text: str) -> bytes:
         """Call Aliyun DashScope CosyVoice API."""
@@ -139,9 +145,7 @@ class CosyVoiceClient:
     ) -> AsyncGenerator[bytes, None]:
         """Streaming TTS variant — yields audio chunks as they become available.
 
-        Uses chunked HTTP streaming when the self-hosted server supports it
-        (POST /v1/inference_sft_stream).  Falls back to synthesize() and yields
-        the whole audio as a single chunk so callers always get an async generator.
+        Fallback chain: self_hosted → dashscope → edge-tts → dummy bytes.
         """
         if self.self_hosted_url:
             try:
@@ -149,11 +153,23 @@ class CosyVoiceClient:
                     yield chunk
                 return
             except Exception as e:
-                logger.warning(f"Streaming TTS failed: {e!r}, falling back to full synthesis")
+                logger.warning(f"Streaming TTS failed: {e!r}, falling back")
 
-        # Fallback: full synthesis, yield as single chunk
-        audio = await self.synthesize(text, voice_ref)
-        yield audio
+        if self.dashscope_api_key:
+            try:
+                audio = await self._synthesize_dashscope(text)
+                yield audio
+                return
+            except Exception as e:
+                logger.warning(f"DashScope TTS failed: {e!r}, trying edge-tts")
+
+        # Last resort: call synthesize() which itself tries edge-tts then raises
+        try:
+            audio = await self.synthesize(text, voice_ref)
+            yield audio
+        except Exception as e:
+            logger.warning(f"All TTS endpoints failed: {e!r}, returning dummy audio")
+            yield b"\x00" * 1024
 
     async def _stream_self_hosted(
         self, text: str, voice_ref: str | None

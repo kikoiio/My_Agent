@@ -2,7 +2,8 @@
 """Multi-Persona Voice Agent — CLI entry point.
 
 Usage:
-    python main.py [--persona assistant]
+    python main.py [--persona assistant]           # text chat
+    python main.py [--persona assistant] --voice   # voice chat (requires hardware)
 
 Type messages to chat with the agent. /quit to exit.
 """
@@ -31,7 +32,7 @@ SECRETS_DIR = PROJECT_ROOT / "backend" / "secrets"
 def _build_tool_registry(memory_store: MemoryStore) -> ToolRegistry:
     """Wire whichever MCP servers have credentials configured.
 
-    Servers without credentials are passed as `None`; the registry will
+    Servers without credentials are passed as ``None``; the registry will
     automatically hide their tools from the LLM.
     """
     bilibili = pyncm = caldav = bocha = None
@@ -74,7 +75,6 @@ def _build_tool_registry(memory_store: MemoryStore) -> ToolRegistry:
         except Exception as e:
             logging.getLogger(__name__).warning("BochaSearchServer init failed: %r", e)
 
-    # Memory is always available (uses local SQLite)
     from backend.mcp_servers.memory import MemoryServer
     memory = MemoryServer(store=memory_store)
 
@@ -84,7 +84,6 @@ def _build_tool_registry(memory_store: MemoryStore) -> ToolRegistry:
         memory=memory,
         caldav=caldav,
         bocha=bocha,
-        # browser / shell intentionally not auto-wired — high-risk, opt-in only
         browser=None,
         shell=None,
     )
@@ -94,7 +93,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Multi-Persona Voice Agent CLI")
     parser.add_argument("--persona", default="assistant", help="Persona name (default: assistant)")
     parser.add_argument("--personas-dir", default="personas", help="Personas root directory")
-    parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (legacy plain mode)")
+    parser.add_argument("--no-tools", action="store_true", help="Disable tool calling")
+    parser.add_argument("--voice", action="store_true", help="Enable voice mode (requires hardware)")
     args = parser.parse_args()
 
     persona_dir = Path(args.personas_dir) / args.persona
@@ -122,7 +122,6 @@ def main() -> None:
         print("  tools: disabled (--no-tools)")
     else:
         registry = _build_tool_registry(memory_store)
-        # Speaker verification not yet wired in text CLI → write tools hidden.
         visible = registry.filter_for_persona(persona, speaker_verified=False)
         print(f"  tools available: {len(visible)} / {len(registry.list_specs())} (speaker_verified=False)")
         for spec in visible:
@@ -141,15 +140,26 @@ def main() -> None:
     )
 
     print(f"\n{'='*50}")
-    print(f"  小安 (Xiao An) — 你的私人助理")
-    print(f"  输入消息开始对话，/quit 退出")
+    if args.voice:
+        print(f"  {persona.name} — 语音模式")
+        print(f"  呼唤「{persona.wake_word or persona.name}」开始对话")
+    else:
+        print(f"  {persona.name} — 文字对话模式")
+        print(f"  输入消息开始对话，/quit 退出")
     print(f"{'='*50}\n")
 
-    asyncio.run(_chat_loop(graph, persona, tracer))
+    if args.voice:
+        asyncio.run(_voice_loop(graph, persona, tracer))
+    else:
+        asyncio.run(_chat_loop(graph, persona, tracer))
 
+
+# ---------------------------------------------------------------------------
+# Text chat loop
+# ---------------------------------------------------------------------------
 
 async def _chat_loop(graph, persona, tracer: Tracer) -> None:
-    """Interactive chat loop."""
+    """Interactive text chat loop."""
     while True:
         try:
             user_input = input("You: ").strip()
@@ -180,7 +190,7 @@ async def _chat_loop(graph, persona, tracer: Tracer) -> None:
                 user_id="owner",
                 trace_id=trace_id,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             tracer.trace_set_error(trace_id, f"{type(e).__name__}: {e}")
             print(f"\n[error] {e}\n")
             continue
@@ -188,10 +198,127 @@ async def _chat_loop(graph, persona, tracer: Tracer) -> None:
         response = state.get("final_response", "")
         tools_called = state.get("tools_called") or []
 
-        print(f"\n小安: {response}")
+        print(f"\n{persona.name}: {response}")
         if tools_called:
             print(f"  [tools: {', '.join(tools_called)}]")
         print(f"  [{trace_id}]\n")
+
+
+# ---------------------------------------------------------------------------
+# Voice loop
+# ---------------------------------------------------------------------------
+
+async def _voice_loop(graph, persona, tracer: Tracer) -> None:
+    """Full voice conversation loop: wake word → STT → LLM → TTS → play.
+
+    Requires: sounddevice, faster-whisper, edge-tts (+ miniaudio for playback).
+    Falls back gracefully when hardware packages are not installed.
+    """
+    # Verify voice deps before entering the loop
+    _check_voice_deps()
+
+    from edge.audio_capture import stream_microphone, capture_until_silence
+    from edge.wakeword import WakeWordListener
+    from backend.tts import play_audio_mp3
+    from backend.tts.edge_tts_client import EdgeTTSClient
+    from backend.streaming.pipeline import _transcribe
+
+    tts_client = EdgeTTSClient()
+    wake_word = persona.wake_word or persona.name
+    listener = WakeWordListener(persona=wake_word)
+
+    print(f"[语音] 正在加载 Whisper 模型（首次启动稍慢）...")
+    await listener.load_model()
+    print(f"[语音] 就绪。呼唤「{wake_word}」开始对话。Ctrl+C 退出。\n")
+
+    try:
+        async for persona_name, confidence in listener.listen(stream_microphone()):
+            print(f"\n[唤醒] {persona_name} (置信度 {confidence:.0%})")
+            print("[录音中...] 请说话（停顿 1.5 秒自动结束）")
+
+            try:
+                audio_arr = await capture_until_silence(
+                    silence_threshold=0.015,
+                    silence_duration=1.5,
+                    max_duration=10.0,
+                )
+            except RuntimeError as exc:
+                print(f"[麦克风错误] {exc}")
+                continue
+
+            if audio_arr is None or len(audio_arr) == 0:
+                print("[无声音] 跳过")
+                continue
+
+            # STT
+            transcript = await _transcribe(audio_arr)
+            if not transcript.strip():
+                print("[识别为空] 跳过")
+                continue
+            print(f"[识别] {transcript}")
+
+            # LLM
+            trace_id = str(uuid.uuid4())[:12]
+            tracer.trace_add(
+                trace_id=trace_id,
+                persona=persona.name,
+                user_id="owner",
+                session_id="owner",
+                role="voice",
+                input_messages_count=1,
+            )
+            try:
+                state = await run_graph(
+                    graph,
+                    input_text=transcript,
+                    persona=persona.name,
+                    user_id="owner",
+                    trace_id=trace_id,
+                )
+            except Exception as exc:
+                tracer.trace_set_error(trace_id, str(exc))
+                print(f"[LLM 错误] {exc}")
+                continue
+
+            response = state.get("final_response", "")
+            tools_called = state.get("tools_called") or []
+
+            print(f"\n{persona.name}: {response}")
+            if tools_called:
+                print(f"  [tools: {', '.join(tools_called)}]")
+
+            # TTS + 播放
+            if response:
+                try:
+                    mp3_bytes = await tts_client.synthesize(response)
+                    await play_audio_mp3(mp3_bytes)
+                except Exception as exc:
+                    print(f"[TTS 错误] {exc}")
+
+            print(f"\n[等待唤醒「{wake_word}」...]\n")
+
+    except KeyboardInterrupt:
+        print("\n再见！")
+
+
+def _check_voice_deps() -> None:
+    """Print warnings for missing voice dependencies (non-fatal)."""
+    missing = []
+    for pkg, install in [
+        ("sounddevice", "sounddevice"),
+        ("faster_whisper", "faster-whisper"),
+        ("edge_tts", "edge-tts"),
+        ("miniaudio", "miniaudio"),
+    ]:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(install)
+
+    if missing:
+        print("[警告] 以下语音依赖未安装，部分功能降级：")
+        print(f"  pip install {' '.join(missing)}")
+        print()
 
 
 if __name__ == "__main__":

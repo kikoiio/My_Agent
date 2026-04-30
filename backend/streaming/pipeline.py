@@ -26,6 +26,30 @@ from backend.observe.tracer import Tracer
 
 _SENTINEL = object()
 
+# Module-level Whisper model singleton — loaded lazily on first STT call.
+_whisper_model = None
+_whisper_model_lock = None
+
+
+def _get_whisper_model():
+    """Return cached WhisperModel, loading it on first call.
+
+    Uses the 'base' model for a good speed/accuracy tradeoff on CPU.
+    Falls back to None if faster-whisper is not installed.
+    """
+    global _whisper_model, _whisper_model_lock
+    import threading
+    if _whisper_model_lock is None:
+        _whisper_model_lock = threading.Lock()
+    with _whisper_model_lock:
+        if _whisper_model is None:
+            try:
+                from faster_whisper import WhisperModel
+                _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+            except ImportError:
+                pass  # returns None — caller falls back to placeholder
+    return _whisper_model
+
 
 @dataclass
 class PipelineResult:
@@ -34,34 +58,67 @@ class PipelineResult:
     latencies: dict[str, float] = field(default_factory=dict)
 
 
+async def _transcribe(audio_array) -> str:
+    """Transcribe a numpy float32 audio array using faster-whisper.
+
+    Args:
+        audio_array: numpy float32 array at 16 kHz, shape (N,).
+
+    Returns:
+        Transcribed text, or empty string on failure.
+    """
+    model = _get_whisper_model()
+    if model is None:
+        return ""
+    try:
+        import numpy as np
+        if hasattr(audio_array, "flatten"):
+            audio_array = audio_array.flatten()
+        arr = np.asarray(audio_array, dtype=np.float32)
+        segments, _info = await asyncio.to_thread(
+            lambda: tuple(model.transcribe(arr, language="zh", condition_on_previous_text=False))
+        )
+        return "".join(s.text for s in segments).strip()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("STT transcription error: %r", exc)
+        return ""
+
+
 async def _stt_stage(
     audio_stream: AsyncIterator[bytes],
     text_queue: asyncio.Queue,
     latencies: dict[str, float],
     t_wakeup: float,
 ) -> str:
-    """Stage 1: consume audio chunks, emit transcript tokens into text_queue.
+    """Stage 1: consume audio chunks, transcribe with Whisper, emit to text_queue.
 
-    Currently a placeholder that emits the audio as a single dummy transcript
-    chunk.  Replace with Whisper / Sherpa-ONNX when hardware is available.
+    Falls back to a placeholder token when faster-whisper is not installed
+    so the pipeline still runs in CI / text-only mode.
     """
-    transcript_parts: list[str] = []
-    first_token = True
-
-    # Placeholder STT: collect all audio then emit one fake token
     audio_chunks: list[bytes] = []
     async for chunk in audio_stream:
         audio_chunks.append(chunk)
 
-    dummy_token = "（STT placeholder）"
-    if first_token:
-        latencies["t_stt_first"] = time.monotonic() - t_wakeup
-        first_token = False
-    await text_queue.put(dummy_token)
-    transcript_parts.append(dummy_token)
+    raw_bytes = b"".join(audio_chunks)
 
+    # Try real Whisper STT
+    transcript = ""
+    if raw_bytes:
+        try:
+            import numpy as np
+            arr = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            transcript = await _transcribe(arr)
+        except Exception:
+            pass  # falls through to placeholder
+
+    if not transcript:
+        transcript = "（STT placeholder）"
+
+    latencies["t_stt_first"] = time.monotonic() - t_wakeup
+    await text_queue.put(transcript)
     await text_queue.put(_SENTINEL)
-    return "".join(transcript_parts)
+    return transcript
 
 
 async def _llm_stage(

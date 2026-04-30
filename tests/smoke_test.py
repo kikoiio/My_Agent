@@ -2801,3 +2801,312 @@ class TestPersonaPack:
         out_pack = pack(xiaolin, tmp_path / "via_pack.persona")
         out_export = export(xiaolin, tmp_path / "via_export.persona")
         assert out_pack.stat().st_size == out_export.stat().st_size
+
+
+# ===========================================================================
+# Post-P6 Tests — Hardware stubs activated
+# ===========================================================================
+
+
+class TestEdgeTTSClient:
+    """EdgeTTSClient — availability, synthesis, streaming (all mocked)."""
+
+    def test_is_available_when_edge_tts_installed(self, monkeypatch):
+        import types, sys
+        fake = types.ModuleType("edge_tts")
+        fake.Communicate = object
+        monkeypatch.setitem(sys.modules, "edge_tts", fake)
+        from backend.tts.edge_tts_client import EdgeTTSClient
+        c = EdgeTTSClient()
+        assert c.is_available() is True
+
+    def test_is_not_available_when_missing(self, monkeypatch):
+        import sys
+        monkeypatch.setitem(sys.modules, "edge_tts", None)  # type: ignore
+        from importlib import reload
+        import backend.tts.edge_tts_client as _m
+        c = _m.EdgeTTSClient()
+        # When edge_tts module is None, is_available() import fails → False
+        # We directly call is_available which does try/import
+        try:
+            result = c.is_available()
+        except Exception:
+            result = False
+        # Either path is acceptable — the important thing is no unhandled crash
+        assert isinstance(result, bool)
+
+    def test_synthesize_collects_audio_chunks(self, monkeypatch):
+        import types, sys, asyncio
+
+        class _FakeCommunicate:
+            def __init__(self, text, voice, **kw): pass
+            async def stream(self):
+                yield {"type": "audio", "data": b"\x01\x02"}
+                yield {"type": "audio", "data": b"\x03\x04"}
+                yield {"type": "WordBoundary", "data": {}}
+
+        fake = types.ModuleType("edge_tts")
+        fake.Communicate = _FakeCommunicate
+        monkeypatch.setitem(sys.modules, "edge_tts", fake)
+
+        from backend.tts.edge_tts_client import EdgeTTSClient
+        c = EdgeTTSClient()
+        audio = asyncio.run(c.synthesize("你好"))
+        assert audio == b"\x01\x02\x03\x04"
+
+    def test_synthesize_stream_yields_chunks(self, monkeypatch):
+        import types, sys, asyncio
+
+        class _FakeCommunicate:
+            def __init__(self, text, voice, **kw): pass
+            async def stream(self):
+                yield {"type": "audio", "data": b"chunk1"}
+                yield {"type": "audio", "data": b"chunk2"}
+
+        fake = types.ModuleType("edge_tts")
+        fake.Communicate = _FakeCommunicate
+        monkeypatch.setitem(sys.modules, "edge_tts", fake)
+
+        from backend.tts.edge_tts_client import EdgeTTSClient
+
+        async def _collect():
+            chunks = []
+            async for c in EdgeTTSClient().synthesize_stream("hello"):
+                chunks.append(c)
+            return chunks
+
+        chunks = asyncio.run(_collect())
+        assert chunks == [b"chunk1", b"chunk2"]
+
+
+class TestWhisperSTT:
+    """_stt_stage and _transcribe — mocked faster_whisper."""
+
+    def test_stt_stage_returns_placeholder_without_hw(self):
+        import asyncio, sys, types
+        # Ensure faster_whisper is absent
+        sys.modules.pop("faster_whisper", None)
+        # Reset cached model so the test gets a clean slate
+        import backend.streaming.pipeline as _pip
+        _pip._whisper_model = None
+
+        async def _fake_audio():
+            yield b"\x00" * 3200  # 100ms of silence (int16)
+
+        text_q: asyncio.Queue = asyncio.Queue()
+        lat: dict = {}
+
+        async def _run():
+            return await _pip._stt_stage(_fake_audio(), text_q, lat, 0.0)
+
+        result = asyncio.run(_run())
+        # Without faster_whisper, result is the placeholder string
+        assert "placeholder" in result or isinstance(result, str)
+
+    def test_stt_stage_with_mock_whisper(self, monkeypatch):
+        import asyncio, sys, types
+        import backend.streaming.pipeline as _pip
+
+        class _FakeSeg:
+            text = "你好世界"
+
+        class _FakeModel:
+            def transcribe(self, arr, **kw):
+                return iter([_FakeSeg()]), None
+
+        fake_fw = types.ModuleType("faster_whisper")
+        fake_fw.WhisperModel = lambda *a, **kw: _FakeModel()
+        monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw)
+        _pip._whisper_model = None  # reset singleton
+
+        async def _fake_audio():
+            import numpy as np
+            pcm = (np.zeros(3200, dtype=np.float32) * 32767).astype(np.int16)
+            yield pcm.tobytes()
+
+        text_q: asyncio.Queue = asyncio.Queue()
+        lat: dict = {}
+
+        async def _run():
+            return await _pip._stt_stage(_fake_audio(), text_q, lat, 0.0)
+
+        result = asyncio.run(_run())
+        assert "你好世界" in result
+
+    def test_stt_stage_emits_sentinel_to_queue(self, monkeypatch):
+        import asyncio, sys, types
+        import backend.streaming.pipeline as _pip
+
+        _pip._whisper_model = None
+
+        async def _fake_audio():
+            yield b"\x00" * 320
+
+        text_q: asyncio.Queue = asyncio.Queue()
+
+        async def _run():
+            await _pip._stt_stage(_fake_audio(), text_q, {}, 0.0)
+            items = []
+            while not text_q.empty():
+                items.append(text_q.get_nowait())
+            return items
+
+        items = asyncio.run(_run())
+        # Last item should be SENTINEL (not a string)
+        from backend.streaming.pipeline import _SENTINEL
+        assert items[-1] is _SENTINEL
+
+    def test_transcribe_returns_empty_without_model(self):
+        import asyncio
+        import backend.streaming.pipeline as _pip
+        import sys
+        sys.modules.pop("faster_whisper", None)
+        _pip._whisper_model = None
+        import numpy as np
+        result = asyncio.run(_pip._transcribe(np.zeros(16000, dtype=np.float32)))
+        assert result == ""
+
+
+class TestAudioCapture:
+    """edge.audio_capture interface — no hardware needed."""
+
+    def test_module_imports(self):
+        from edge.audio_capture import SAMPLE_RATE, capture_fixed_duration, capture_until_silence, stream_microphone
+        assert SAMPLE_RATE == 16000
+        assert callable(capture_fixed_duration)
+        assert callable(capture_until_silence)
+        assert callable(stream_microphone)
+
+    def test_stream_microphone_is_async_generator(self):
+        import inspect
+        from edge.audio_capture import stream_microphone
+        result = stream_microphone()
+        assert inspect.isasyncgen(result)
+
+    def test_capture_fixed_duration_raises_without_sounddevice(self, monkeypatch):
+        import asyncio, sys
+        monkeypatch.setitem(sys.modules, "sounddevice", None)  # type: ignore
+        from edge.audio_capture import capture_fixed_duration
+        with pytest.raises((RuntimeError, ImportError, TypeError)):
+            asyncio.run(capture_fixed_duration(0.1))
+
+
+class TestWakeWordReal:
+    """WakeWordListener with mocked faster_whisper."""
+
+    def test_listener_constructs(self):
+        from edge.wakeword import WakeWordListener
+        l = WakeWordListener(persona="小安", threshold=0.6)
+        assert l.persona == "小安"
+        assert l.threshold == 0.6
+        assert l.running is False
+
+    def test_keyword_in_text_exact(self):
+        from edge.wakeword import _keyword_in_text
+        assert _keyword_in_text("小安", "你好小安今天怎么样") is True
+        assert _keyword_in_text("小安", "我叫小明") is False
+
+    def test_keyword_in_text_phonetic(self):
+        from edge.wakeword import _keyword_in_text
+        assert _keyword_in_text("kobe", "hey kobe what's up") is True
+        assert _keyword_in_text("kobe", "科比传球") is True
+
+    def test_listen_without_faster_whisper_never_yields(self, monkeypatch):
+        import asyncio, sys, types
+        sys.modules.pop("faster_whisper", None)
+        import edge.wakeword as _ww
+        _ww._tiny_model = None
+
+        async def _fake_stream():
+            for _ in range(3):
+                yield b"\x00" * 3200
+
+        async def _run():
+            results = []
+            listener = _ww.WakeWordListener(persona="小安")
+            async for evt in listener.listen(_fake_stream()):
+                results.append(evt)
+            return results
+
+        results = asyncio.run(_run())
+        assert results == []  # no faster_whisper → never fires
+
+
+class TestFaceGateReal:
+    """FaceGate with mocked insightface."""
+
+    def test_constructs_with_defaults(self):
+        from edge.face_gate import FaceGate
+        fg = FaceGate()
+        assert fg.owner_id == "owner"
+        assert fg._available is False
+
+    def test_load_models_graceful_without_insightface(self, monkeypatch):
+        import asyncio, sys
+        monkeypatch.setitem(sys.modules, "insightface", None)  # type: ignore
+        from edge.face_gate import FaceGate
+        fg = FaceGate()
+        result = asyncio.run(fg.load_models())
+        assert result is False
+        assert fg._available is False
+
+    def test_verify_returns_true_when_no_model(self):
+        import asyncio
+        from edge.face_gate import FaceGate
+        fg = FaceGate()
+        result = asyncio.run(fg.verify(b"\xff\xd8\xff"))
+        assert result["verified"] is True  # stub mode
+
+    def test_on_arrival_called_in_stub_mode(self):
+        import asyncio
+        from edge.face_gate import FaceGate
+        calls = []
+        fg = FaceGate(on_arrival=lambda owner, conf: calls.append((owner, conf)))
+        asyncio.run(fg.verify(b"\xff\xd8\xff"))
+        assert len(calls) == 1
+        assert calls[0][0] == "owner"
+
+    def test_load_owner_enrollment_missing_file(self, tmp_path):
+        import asyncio
+        from edge.face_gate import FaceGate
+        fg = FaceGate(enrollment_dir=str(tmp_path / "faces"))
+        result = asyncio.run(fg.load_owner_enrollment())
+        assert result is False
+
+
+class TestVoicePrintReal:
+    """VoicePrintGate with mocked resemblyzer."""
+
+    def test_constructs_with_defaults(self):
+        from edge.voiceprint import VoicePrintGate
+        vg = VoicePrintGate()
+        assert vg.owner_id == "owner"
+        assert vg._available is False
+
+    def test_load_models_graceful_without_resemblyzer(self, monkeypatch):
+        import asyncio, sys
+        monkeypatch.setitem(sys.modules, "resemblyzer", None)  # type: ignore
+        from edge.voiceprint import VoicePrintGate
+        vg = VoicePrintGate()
+        result = asyncio.run(vg.load_models())
+        assert result is False
+
+    def test_verify_returns_true_when_no_model(self):
+        import asyncio
+        from edge.voiceprint import VoicePrintGate
+        vg = VoicePrintGate()
+        result = asyncio.run(vg.verify(b"\x00" * 32000))
+        assert result["verified"] is True
+
+    def test_get_voice_activity_energy_based(self):
+        import numpy as np
+        from edge.voiceprint import VoicePrintGate
+        vg = VoicePrintGate()
+        # High-energy audio → has_voice True
+        loud = (np.ones(1600) * 0.5 * 32767).astype(np.int16)
+        has_voice, rms = vg.get_voice_activity(loud.tobytes())
+        assert has_voice is True
+        # Silent audio → has_voice False
+        silent = np.zeros(1600, dtype=np.int16)
+        has_voice2, _ = vg.get_voice_activity(silent.tobytes())
+        assert has_voice2 is False

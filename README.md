@@ -1,6 +1,6 @@
 # My Agent — 本地语音 AI 伴侣
 
-[![Tests](https://img.shields.io/badge/tests-257%20passing-brightgreen)](tests/smoke_test.py)
+[![Tests](https://img.shields.io/badge/tests-281%20passing-brightgreen)](tests/smoke_test.py)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 
@@ -15,7 +15,10 @@
 ```bash
 git clone <repo-url>
 cd My_agent
-pip install -r requirements.txt
+pip install -r requirements.txt          # 核心依赖（CI 测试用）
+
+# 语音模式额外依赖（STT/TTS/人脸/声纹）
+pip install -r requirements-voice.txt
 ```
 
 **2. 配置密钥**
@@ -28,17 +31,22 @@ cp backend/secrets/accounts.env.example backend/secrets/accounts.env
 # 可选：填入 B 站 / 网易云 cookie 以启用媒体工具
 ```
 
-**3. 启动 CLI 对话**
+**3. 启动对话**
 
 ```bash
+# 文字模式（无需硬件）
 python main.py                      # 默认人格（小安）
 python main.py --persona xiaolin    # 切换到晓林人格
+
+# 语音模式（需麦克风 + 音箱）
+python main.py --voice              # 呼唤「小安」开始对话
+python scripts/enroll_owner.py     # 首次使用：注册人脸 + 声纹
 ```
 
 **4. 运行测试**
 
 ```bash
-python -m pytest tests/smoke_test.py -v   # 257 个测试，全绿
+python -m pytest tests/smoke_test.py -v   # 281 个测试，全绿，无需硬件
 ```
 
 **5. Docker 部署（可选）**
@@ -66,6 +74,8 @@ docker compose -f deploy/docker-compose.yml up -d
 ```
 
 **数据流：** 语音 → openWakeWord（人格名触发）→ Whisper STT → LangGraph → LiteLLM → CosyVoice TTS → 音箱。
+
+> **当前阶段（Post-P6）：** CLI 文字对话已完整可用。STT（`_stt_stage`）和 TTS（`cosyvoice_client.py`）仍为占位存根，唤醒词 / 人脸识别 / 声纹模块同为存根，等待 Whisper + sounddevice + insightface 接入。外设（USB 摄像头 C922、USB 音箱 Philips SPA3809）已确认被系统识别。
 
 **记忆层：**
 - L1（全局）：系统级上下文，永久保留

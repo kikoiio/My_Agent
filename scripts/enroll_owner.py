@@ -1,128 +1,204 @@
 #!/usr/bin/env python3
-"""Enroll owner for biometric gates (face + voice).
+"""Enroll owner biometrics (face + voice) for the gate system.
 
-Per plan.md §11.6: Capture face and voice samples for owner verification.
+Face enrollment: Opens the default camera, lets you capture 5 photos from
+different angles by pressing SPACE, then saves the average embedding.
+
+Voice enrollment: Records 3 audio samples of ~4 seconds each, then saves the
+averaged GE2E embedding for speaker verification.
+
+Usage:
+    python scripts/enroll_owner.py                  # both face + voice
+    python scripts/enroll_owner.py --face-only
+    python scripts/enroll_owner.py --voice-only
+    python scripts/enroll_owner.py --owner-id alice
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 __all__ = ["main"]
 
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# --------------------------------------------------------------------------- #
+# Face enrollment
+# --------------------------------------------------------------------------- #
 
 async def enroll_face(owner_id: str = "owner") -> bool:
-    """Enroll owner face for visual gate.
+    """Capture 5 face photos and save the enrollment embedding.
 
-    Args:
-        owner_id: Owner identifier
-
-    Returns:
-        True if successfully enrolled
+    Opens the default camera (index 0).  Press SPACE to capture each frame.
     """
-    logger.info("Face enrollment: ensure good lighting and face visibility")
-    logger.info("Taking 5 photos from different angles...")
-
     try:
-        # Placeholder: would use camera to capture images
-        # import cv2
-        # cap = cv2.VideoCapture(0)
-        # face_images = []
-        # for i in range(5):
-        #     print(f"Capture {i+1}/5 - Press SPACE to capture")
-        #     while True:
-        #         ret, frame = cap.read()
-        #         cv2.imshow("Face Enrollment", frame)
-        #         if cv2.waitKey(1) & 0xFF == ord(' '):
-        #             face_images.append(frame)
-        #             logger.info(f"Captured {i+1}/5")
-        #             break
-
-        # from edge.face_gate import FaceGate
-        # gate = FaceGate(owner_id=owner_id)
-        # await gate.load_models()
-        # success = await gate.enroll_owner(face_images[0])
-
-        logger.info(f"Face enrollment successful for {owner_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Face enrollment failed: {e}")
+        import cv2
+    except ImportError:
+        logger.error("opencv-python-headless not installed. Run: pip install opencv-python-headless")
         return False
 
+    from edge.face_gate import FaceGate
 
-async def enroll_voice(owner_id: str = "owner") -> bool:
-    """Enroll owner voice for voice gate.
-
-    Args:
-        owner_id: Owner identifier
-
-    Returns:
-        True if successfully enrolled
-    """
-    logger.info("Voice enrollment: clear pronunciation is important")
-    logger.info("Recording 3 voice samples (~3 seconds each)...")
-
-    try:
-        # Placeholder: would record voice samples
-        # import sounddevice as sd
-        # import soundfile as sf
-        # voice_samples = []
-        # for i in range(3):
-        #     print(f"Sample {i+1}/3: Press Enter to start, speak, then press again")
-        #     input()
-        #     audio = sd.rec(int(3 * 16000), samplerate=16000, channels=1)
-        #     sd.wait()
-        #     voice_samples.append(audio)
-        #     logger.info(f"Recorded sample {i+1}/3")
-
-        # from edge.voiceprint import VoicePrintGate
-        # gate = VoicePrintGate(owner_id=owner_id)
-        # await gate.load_models()
-        # success = await gate.enroll_owner(voice_samples)
-
-        logger.info(f"Voice enrollment successful for {owner_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Voice enrollment failed: {e}")
+    gate = FaceGate(owner_id=owner_id)
+    if not await gate.load_models():
+        logger.error("Could not load InsightFace models")
         return False
 
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logger.error("Could not open camera (index 0)")
+        return False
 
-async def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Enroll owner for biometric gates")
-    parser.add_argument("--owner-id", default="owner", help="Owner identifier")
-    parser.add_argument("--face-only", action="store_true", help="Enroll face only")
-    parser.add_argument("--voice-only", action="store_true", help="Enroll voice only")
+    print("\n[人脸注册] 请保持光线充足，正对摄像头。")
+    print("按 SPACE 键拍摄，共需 5 张（不同角度）。按 Q 放弃。\n")
 
+    captured_images: list[bytes] = []
+    embeddings = []
+
+    try:
+        import numpy as np
+
+        while len(captured_images) < 5:
+            ret, frame = cap.read()
+            if not ret:
+                logger.error("Camera read failed")
+                break
+
+            overlay = frame.copy()
+            cv2.putText(
+                overlay,
+                f"[{len(captured_images)}/5] SPACE=capture  Q=quit",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+            )
+            cv2.imshow("Face Enrollment", overlay)
+
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord("q"):
+                print("放弃注册。")
+                return False
+            if key == ord(" "):
+                _, buf = cv2.imencode(".jpg", frame)
+                image_bytes = buf.tobytes()
+                result = await gate.enroll_owner(image_bytes)
+                if result:
+                    captured_images.append(image_bytes)
+                    print(f"  ✓ 拍摄 {len(captured_images)}/5")
+                else:
+                    print("  ✗ 未检测到人脸，请重试")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    if len(captured_images) < 3:
+        logger.error("Not enough face samples (need at least 3, got %d)", len(captured_images))
+        return False
+
+    print(f"\n✓ 人脸注册成功（{len(captured_images)} 张）→ data/enrollments/faces/{owner_id}.npy\n")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Voice enrollment
+# --------------------------------------------------------------------------- #
+
+async def enroll_voice(owner_id: str = "owner", num_samples: int = 3) -> bool:
+    """Record voice samples and save the enrollment embedding."""
+    try:
+        import sounddevice as sd
+        import numpy as np
+    except ImportError:
+        logger.error("sounddevice not installed. Run: pip install sounddevice")
+        return False
+
+    from edge.voiceprint import VoicePrintGate
+
+    gate = VoicePrintGate(owner_id=owner_id)
+    if not await gate.load_models():
+        logger.error("Could not load resemblyzer model")
+        return False
+
+    print("\n[声纹注册] 将录制 %d 段音频，每段约 4 秒。" % num_samples)
+    print("请说一段自然的中文（如自我介绍），录完后自动停止。\n")
+
+    DURATION = 4.0
+    SAMPLE_RATE = 16_000
+    audio_samples: list[bytes] = []
+
+    for i in range(num_samples):
+        input(f"[{i+1}/{num_samples}] 按 Enter 开始录音...")
+        print("  🎙  录音中... 请说话")
+
+        audio = await asyncio.to_thread(
+            sd.rec,
+            int(DURATION * SAMPLE_RATE),
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+        )
+        await asyncio.to_thread(sd.wait)
+
+        import io, wave
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # int16 = 2 bytes
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio.tobytes())
+        audio_samples.append(buf.getvalue())
+        print(f"  ✓ 录制完成 {i+1}/{num_samples}\n")
+
+    success = await gate.enroll_owner(audio_samples)
+    if success:
+        print(f"✓ 声纹注册成功（{num_samples} 段）→ data/enrollments/voices/{owner_id}.npy\n")
+    else:
+        print("✗ 声纹注册失败")
+    return success
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+async def main() -> bool:
+    parser = argparse.ArgumentParser(description="注册主人生物特征（人脸 + 声纹）")
+    parser.add_argument("--owner-id", default="owner", help="主人标识符（默认 owner）")
+    parser.add_argument("--face-only", action="store_true", help="仅注册人脸")
+    parser.add_argument("--voice-only", action="store_true", help="仅注册声纹")
+    parser.add_argument("--voice-samples", type=int, default=3, help="声纹录音段数（默认 3）")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
-
-    # Create enrollment directory
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     Path("data/enrollments").mkdir(parents=True, exist_ok=True)
 
     success = True
 
-    # Enroll biometric modalities
     if not args.voice_only:
         face_ok = await enroll_face(args.owner_id)
         success = success and face_ok
 
     if not args.face_only:
-        voice_ok = await enroll_voice(args.owner_id)
+        voice_ok = await enroll_voice(args.owner_id, num_samples=args.voice_samples)
         success = success and voice_ok
 
     if success:
-        logger.info(f"Owner enrollment complete: {args.owner_id}")
+        print("=" * 50)
+        print(f"✓ 主人注册完成：{args.owner_id}")
+        print(f"  人脸: data/enrollments/faces/{args.owner_id}.npy")
+        print(f"  声纹: data/enrollments/voices/{args.owner_id}.npy")
+        print("=" * 50)
     else:
-        logger.error("Enrollment incomplete due to errors")
+        print("✗ 注册未完全成功，请检查上方错误信息")
 
     return success
 
 
 if __name__ == "__main__":
-    success = asyncio.run(main())
-    exit(0 if success else 1)
+    ok = asyncio.run(main())
+    sys.exit(0 if ok else 1)
