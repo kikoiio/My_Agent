@@ -109,15 +109,19 @@ async def enroll_face(owner_id: str = "owner") -> bool:
 # --------------------------------------------------------------------------- #
 
 async def enroll_voice(owner_id: str = "owner", num_samples: int = 3) -> bool:
-    """Record voice samples and save the enrollment embedding."""
+    """Record voice samples and save the enrollment embedding.
+
+    Uses edge.audio_capture.capture_fixed_duration which automatically handles
+    Windows WASAPI / native sample rate / stereo-to-mono conversion.
+    """
     try:
-        import sounddevice as sd
-        import numpy as np
+        import sounddevice  # noqa: F401  just to give an early friendly error
     except ImportError:
         logger.error("sounddevice not installed. Run: pip install sounddevice")
         return False
 
     from edge.voiceprint import VoicePrintGate
+    from edge.audio_capture import capture_fixed_duration
 
     gate = VoicePrintGate(owner_id=owner_id)
     if not await gate.load_models():
@@ -128,29 +132,29 @@ async def enroll_voice(owner_id: str = "owner", num_samples: int = 3) -> bool:
     print("请说一段自然的中文（如自我介绍），录完后自动停止。\n")
 
     DURATION = 4.0
-    SAMPLE_RATE = 16_000
+    SAMPLE_RATE = 16_000  # capture_fixed_duration always returns 16 kHz mono
     audio_samples: list[bytes] = []
 
     for i in range(num_samples):
         input(f"[{i+1}/{num_samples}] 按 Enter 开始录音...")
         print("  🎙  录音中... 请说话")
 
-        audio = await asyncio.to_thread(
-            sd.rec,
-            int(DURATION * SAMPLE_RATE),
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-        )
-        await asyncio.to_thread(sd.wait)
+        try:
+            # Returns float32 numpy array at 16 kHz mono (handles WASAPI/resample)
+            audio_float = await capture_fixed_duration(DURATION)
+        except Exception as exc:
+            logger.error("录音失败: %r", exc)
+            return False
 
-        import io, wave
+        # Convert float32 → int16 WAV bytes for resemblyzer
+        import io, wave, numpy as np
+        audio_int16 = (np.clip(audio_float, -1.0, 1.0) * 32767).astype(np.int16)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)  # int16 = 2 bytes
+            wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(audio.tobytes())
+            wf.writeframes(audio_int16.tobytes())
         audio_samples.append(buf.getvalue())
         print(f"  ✓ 录制完成 {i+1}/{num_samples}\n")
 
