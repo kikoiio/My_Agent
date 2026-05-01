@@ -8,9 +8,11 @@ Provides two capture modes:
 All audio is returned as 16 kHz mono float32 unless otherwise noted.
 
 Windows note:
-  MME host API often rejects mono / 16 kHz requests (e.g. C922 only supports
-  stereo 44100 in MME mode).  _find_input_device() prefers WASAPI and
-  auto-detects the native sample rate; _resample() handles the conversion.
+  MME host API rejects mono / 16 kHz requests (e.g. C922 only supports stereo
+  44100 via MME).  We always pass device=None (OS default) to avoid invalid
+  device ID errors caused by USB adapter index misalignment, and request the
+  native sample rate + stereo first.  Stereo → mono conversion and resampling
+  to 16 kHz are done in Python via numpy.
 """
 
 from __future__ import annotations
@@ -37,37 +39,22 @@ _CHUNK_FRAMES = 1_600         # 100 ms at 16 kHz
 # ---------------------------------------------------------------------------
 
 def _find_input_device() -> tuple[int | None, int]:
-    """Return (device_id, native_sample_rate) for the best available input.
+    """Return (device_id, native_sample_rate) for the default input device.
 
-    Priority: WASAPI > DirectSound > MME.
-    Falls back to the sounddevice default input device when no preferred API
-    is found.
+    Always returns device_id=None so that PortAudio uses whatever the OS has
+    configured as the default recording device.  Enumerating a specific device
+    ID is unreliable on Windows when USB adapters shift the device list indices
+    (paInvalidDevice -9996).
+
+    native_sample_rate is read from the default input device info so callers
+    can record at the device's native SR and resample afterwards.
     """
     import sounddevice as sd
 
-    apis = sd.query_hostapis()
-    devices = sd.query_devices()
-
-    preferred_apis = ["Windows WASAPI", "Windows DirectSound", "MME",
-                      "Core Audio", "ALSA", "OSS"]  # rough cross-platform priority
-
-    for preferred in preferred_apis:
-        idx = next((i for i, a in enumerate(apis) if preferred in a["name"]), None)
-        if idx is None:
-            continue
-        for dev_id, dev in enumerate(devices):
-            if dev["hostapi"] == idx and dev["max_input_channels"] > 0:
-                sr = int(dev["default_samplerate"]) or SAMPLE_RATE
-                logger.debug(
-                    "Selected input device [%d] %s | api=%s | sr=%d",
-                    dev_id, dev["name"], preferred, sr,
-                )
-                return dev_id, sr
-
-    # Fall back to sounddevice default
     try:
         info = sd.query_devices(kind="input")
         sr = int(info.get("default_samplerate") or SAMPLE_RATE)
+        logger.debug("Default input device: %s | sr=%d", info.get("name"), sr)
         return None, sr
     except Exception:
         return None, SAMPLE_RATE
