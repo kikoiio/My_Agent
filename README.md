@@ -1,4 +1,4 @@
-# My Agent — 本地语音 AI 伴侣
+# My Agent — 本地语音 AI 
 
 [![Tests](https://img.shields.io/badge/tests-257%20passing-brightgreen)](tests/smoke_test.py)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
