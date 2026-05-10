@@ -149,10 +149,13 @@ def main() -> None:
         print(f"  输入消息开始对话，/quit 退出")
     print(f"{'='*50}\n")
 
-    if args.voice:
-        asyncio.run(_voice_loop(graph, persona, tracer, memory_store))
-    else:
-        asyncio.run(_chat_loop(graph, persona, tracer))
+    try:
+        if args.voice:
+            asyncio.run(_voice_loop(graph, persona, tracer, memory_store))
+        else:
+            asyncio.run(_chat_loop(graph, persona, tracer))
+    except KeyboardInterrupt:
+        print("\n再见！")
 
 
 # ---------------------------------------------------------------------------
