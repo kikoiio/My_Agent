@@ -3110,3 +3110,246 @@ class TestVoicePrintReal:
         silent = np.zeros(1600, dtype=np.int16)
         has_voice2, _ = vg.get_voice_activity(silent.tobytes())
         assert has_voice2 is False
+
+
+# ---------------------------------------------------------------------------
+# Multi-voice per persona
+# ---------------------------------------------------------------------------
+
+
+class TestPersonaVoice:
+    """Persona loads and exposes the edge-tts voice field from persona.yaml."""
+
+    def test_default_voice_when_no_yaml(self, tmp_path):
+        from core.persona import load
+        # Build a minimal persona dir (no persona.yaml)
+        (tmp_path / "system_prompt.md").write_text("You are a helpful assistant.", encoding="utf-8")
+        p = load(tmp_path)
+        assert p.voice == "zh-CN-XiaoxiaoNeural"
+
+    def test_voice_from_yaml(self, tmp_path):
+        from core.persona import load
+        (tmp_path / "system_prompt.md").write_text("You are a helper.", encoding="utf-8")
+        (tmp_path / "persona.yaml").write_text(
+            "name: 晓林\nwake_word: 晓林\nvoice: zh-CN-XiaoyiNeural\n",
+            encoding="utf-8",
+        )
+        p = load(tmp_path)
+        assert p.voice == "zh-CN-XiaoyiNeural"
+
+    def test_voice_fallback_when_yaml_missing_key(self, tmp_path):
+        from core.persona import load
+        (tmp_path / "system_prompt.md").write_text("Hi.", encoding="utf-8")
+        (tmp_path / "persona.yaml").write_text("name: 测试\nwake_word: 测试\n", encoding="utf-8")
+        p = load(tmp_path)
+        assert p.voice == "zh-CN-XiaoxiaoNeural"
+
+    def test_assistant_persona_has_voice(self):
+        from core.persona import load
+        p = load(Path("personas/assistant"))
+        assert p.voice  # non-empty
+        assert p.voice.startswith("zh-")
+
+    def test_xiaolin_persona_has_distinct_voice(self):
+        from core.persona import load
+        assistant = load(Path("personas/assistant"))
+        xiaolin = load(Path("personas/xiaolin"))
+        assert xiaolin.voice != assistant.voice
+
+
+# ---------------------------------------------------------------------------
+# Proactive background task
+# ---------------------------------------------------------------------------
+
+
+class TestProactiveTask:
+    """_proactive_task wires scanner events to TTS without overlapping turns."""
+
+    def _make_store(self, tmp_path):
+        from backend.memory.store import MemoryStore
+        return MemoryStore(str(tmp_path / "mem.db"))
+
+    def test_task_cancels_cleanly(self, tmp_path):
+        import asyncio
+
+        store = self._make_store(tmp_path)
+        calls = []
+
+        async def fake_tts_synthesize(text, voice=None):
+            calls.append(text)
+            return b"mp3"
+
+        async def fake_play(data):
+            pass
+
+        class FakeTTS:
+            async def synthesize(self, text, voice=None):
+                return await fake_tts_synthesize(text, voice)
+
+        async def run():
+            from main import _proactive_task
+            lock = asyncio.Lock()
+            task = asyncio.create_task(
+                _proactive_task(store, "assistant", FakeTTS(), fake_play, lock, interval=9999)
+            )
+            await asyncio.sleep(0)  # let task start
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(run())
+        assert calls == []  # no events fired (interval not reached)
+
+    def test_task_speaks_top_event(self, tmp_path):
+        import asyncio
+        from core.types import ProactiveEvent
+
+        store = self._make_store(tmp_path)
+        spoken: list[str] = []
+
+        class FakeTTS:
+            async def synthesize(self, text, voice=None):
+                spoken.append(text)
+                return b"mp3"
+
+        async def fake_play(data):
+            pass
+
+        fake_events = [
+            ProactiveEvent(
+                trigger="emotion_trend",
+                persona="assistant",
+                user_id="owner",
+                message="最近好吗？",
+                priority=3,
+            ),
+        ]
+
+        async def fake_scan(store, user_id, persona):
+            return fake_events
+
+        async def run():
+            import main as main_mod
+            original_scan = None
+            from backend.proactive import scanner as scanner_mod
+            original_scan = scanner_mod.proactive_scan
+
+            scanner_mod.proactive_scan = fake_scan
+            try:
+                from main import _proactive_task
+                lock = asyncio.Lock()
+                task = asyncio.create_task(
+                    _proactive_task(store, "assistant", FakeTTS(), fake_play, lock, interval=0.01)
+                )
+                await asyncio.sleep(0.1)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            finally:
+                scanner_mod.proactive_scan = original_scan
+
+        asyncio.run(run())
+        assert "最近好吗？" in spoken
+
+    def test_task_respects_turn_lock(self, tmp_path):
+        """Proactive TTS waits if main loop holds the turn lock."""
+        import asyncio
+        from core.types import ProactiveEvent
+
+        store = self._make_store(tmp_path)
+        spoken: list[str] = []
+        lock_held_during_speech = []
+
+        async def fake_play(data):
+            pass
+
+        class FakeTTS:
+            async def synthesize(self, text, voice=None):
+                spoken.append(text)
+                return b"mp3"
+
+        fake_events = [
+            ProactiveEvent(
+                trigger="topic_followup",
+                persona="assistant",
+                user_id="owner",
+                message="你上次提到工作怎么样了？",
+                priority=2,
+            ),
+        ]
+
+        async def fake_scan(store, user_id, persona):
+            return fake_events
+
+        async def run():
+            from backend.proactive import scanner as scanner_mod
+            original = scanner_mod.proactive_scan
+            scanner_mod.proactive_scan = fake_scan
+            try:
+                from main import _proactive_task
+                lock = asyncio.Lock()
+                # Hold the lock for 0.1s, then release
+                async with lock:
+                    task = asyncio.create_task(
+                        _proactive_task(store, "assistant", FakeTTS(), fake_play, lock, interval=0.01)
+                    )
+                    await asyncio.sleep(0.05)
+                    # lock is still held here — task should not have spoken yet
+                    lock_held_during_speech.append(len(spoken) == 0)
+                # lock released — task should now speak
+                await asyncio.sleep(0.15)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            finally:
+                scanner_mod.proactive_scan = original
+
+        asyncio.run(run())
+        assert lock_held_during_speech and lock_held_during_speech[0] is True
+        assert "你上次提到工作怎么样了？" in spoken
+
+    def test_task_skips_on_scan_error(self, tmp_path):
+        """Scanner exception does not crash the background task."""
+        import asyncio
+
+        store = self._make_store(tmp_path)
+        spoken: list[str] = []
+
+        class FakeTTS:
+            async def synthesize(self, text, voice=None):
+                spoken.append(text)
+                return b"mp3"
+
+        async def fake_play(data):
+            pass
+
+        async def bad_scan(store, user_id, persona):
+            raise RuntimeError("scan exploded")
+
+        async def run():
+            from backend.proactive import scanner as scanner_mod
+            original = scanner_mod.proactive_scan
+            scanner_mod.proactive_scan = bad_scan
+            try:
+                from main import _proactive_task
+                lock = asyncio.Lock()
+                task = asyncio.create_task(
+                    _proactive_task(store, "assistant", FakeTTS(), fake_play, lock, interval=0.01)
+                )
+                await asyncio.sleep(0.1)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            finally:
+                scanner_mod.proactive_scan = original
+
+        asyncio.run(run())
+        assert spoken == []  # error swallowed, nothing spoken

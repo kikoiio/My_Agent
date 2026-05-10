@@ -15,6 +15,7 @@ class Persona:
     voice_ref_path: Path | None
     voice_ref_text: str
     wake_model_path: Path | None
+    voice: str = "zh-CN-XiaoxiaoNeural"  # edge-tts voice ID for this persona
     tools_allowed: list[str] = field(default_factory=list)
     tools_denied: list[str] = field(default_factory=list)
     require_speaker_verify: list[str] = field(default_factory=list)
@@ -35,6 +36,7 @@ def load(persona_dir: Path) -> Persona:
     if persona_yaml_path.exists():
         persona_meta = yaml.safe_load(persona_yaml_path.read_text(encoding="utf-8")) or {}
     wake_word: str = persona_meta.get("wake_word") or persona_meta.get("name") or name
+    voice: str = persona_meta.get("voice") or "zh-CN-XiaoxiaoNeural"
 
     sp_path = persona_dir / "system_prompt.md"
     # 也支持 system.jinja2 作为 system prompt（P2 新格式）
@@ -75,6 +77,7 @@ def load(persona_dir: Path) -> Persona:
         voice_ref_path=voice_ref_path,
         voice_ref_text=voice_ref_text,
         wake_model_path=wake if wake.exists() else None,
+        voice=voice,
         tools_allowed=list(tools_data.get("allowed") or []),
         tools_denied=list(tools_data.get("denied") or []),
         require_speaker_verify=list(tools_data.get("require_speaker_verify") or []),

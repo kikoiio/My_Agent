@@ -11,7 +11,7 @@ import asyncio
 import logging
 from typing import AsyncGenerator
 
-__all__ = ["play_audio_mp3", "play_audio_streaming"]
+__all__ = ["play_audio_mp3", "play_audio_streaming", "_find_output_device"]
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,43 @@ async def play_audio_streaming(
         await play_audio_mp3(mp3_bytes)
 
 
+def _find_output_device() -> int | None:
+    """Return output device ID, or None for the OS default.
+
+    Reads VOICE_OUTPUT_DEVICE from the environment:
+    - Integer string → use that device index directly
+    - Non-integer string → case-insensitive substring match on device name
+    - Unset / empty → return None (PortAudio OS default)
+
+    Example:
+        $env:VOICE_OUTPUT_DEVICE = "Philips"   # match by name
+        $env:VOICE_OUTPUT_DEVICE = "3"         # use device index 3
+    """
+    import os
+    import sounddevice as sd
+
+    spec = os.environ.get("VOICE_OUTPUT_DEVICE", "").strip()
+    if not spec:
+        return None
+    try:
+        idx = int(spec)
+        logger.debug("Using output device index %d (VOICE_OUTPUT_DEVICE)", idx)
+        return idx
+    except ValueError:
+        pass
+    spec_lower = spec.lower()
+    try:
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d.get("max_output_channels", 0) > 0 and spec_lower in d.get("name", "").lower():
+                logger.info("Output device [%d]: %s", i, d["name"])
+                return i
+    except Exception:
+        pass
+    logger.warning("VOICE_OUTPUT_DEVICE=%r not found; using OS default", spec)
+    return None
+
+
 def _play_with_miniaudio(mp3_bytes: bytes, *, blocking: bool) -> None:
     """Decode with miniaudio → play with sounddevice (synchronous)."""
     import miniaudio
@@ -72,7 +109,8 @@ def _play_with_miniaudio(mp3_bytes: bytes, *, blocking: bool) -> None:
         sample_rate=24000,
     )
     samples = np.frombuffer(decoded.samples, dtype=np.int16).astype(np.float32) / 32768.0
-    sd.play(samples, samplerate=decoded.sample_rate)
+    output_device = _find_output_device()
+    sd.play(samples, samplerate=decoded.sample_rate, device=output_device)
     if blocking:
         sd.wait()
 
