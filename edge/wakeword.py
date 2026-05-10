@@ -151,13 +151,24 @@ class WakeWordListener:
                             )
                         )
                     )
-                    text = "".join(s.text for s in segments)
+                    segs = list(segments)
+                    if not segs:
+                        continue
+                    # Use Whisper's own quality signals:
+                    #   avg_logprob ∈ (-inf, 0] → map [-1, 0] → [0, 1] as confidence
+                    #   no_speech_prob: skip window if likely silence
+                    no_speech_prob = segs[0].no_speech_prob
+                    if no_speech_prob > 0.6:
+                        continue
+                    avg_logprob = sum(s.avg_logprob for s in segs) / len(segs)
+                    conf = max(0.0, min(1.0, 1.0 + avg_logprob))
+                    text = "".join(s.text for s in segs)
                     if text.strip():
-                        logger.debug("Wake window transcript: %r", text)
-                    if _keyword_in_text(self.persona, text):
-                        logger.info("Wake word '%s' detected in: %r", self.persona, text)
+                        logger.debug("Wake window transcript: %r (conf=%.2f)", text, conf)
+                    if conf >= self.threshold and _keyword_in_text(self.persona, text):
+                        logger.info("Wake word '%s' detected: %r (conf=%.2f)", self.persona, text, conf)
                         cooldown_chunks = 6  # ~3 seconds cooldown
-                        yield (self.persona, 0.85)
+                        yield (self.persona, conf)
                 except Exception as exc:
                     logger.debug("Wake word transcription error: %r", exc)
         finally:

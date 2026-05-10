@@ -4,61 +4,42 @@ Living document. Update after each task with new decisions, pitfalls, or changed
 
 ---
 
-## ⚡ Hand-off Snapshot (2026-05-10 v4 — P7.1–P7.3 完成，待 P7.4 端到端测试)
+## ⚡ Hand-off Snapshot (2026-05-10 v5 — 语音循环全功能就绪)
 
-> **基础设施层 P1–P6 完成 + P7.1–P7.3 完成。** 281 smoke tests 全绿。语音依赖装好（Python 3.14 wheel 可用），owner 人脸 + 声纹注册完成。
-> **下一步**：P7.4 端到端语音对话（`python main.py --persona assistant --voice`），呼"小安"跑通 wake→STT→LLM→TTS→蓝牙音箱全链路。
-> **本机硬件状态**：USB Logitech C922 摄像头自带麦（默认输入）、Philips SPA3809 USB 音箱（默认输出）、蓝牙音箱已配对（[25/27]，btha2dp）但未设为默认输出。
+> **290 smoke tests 全绿。** P7.1–P7.3 完成 + 语音循环四个已知问题修复 + 多音色 per persona + 主动感知消费者接入。
+> **当前状态**：可以跑 `python main.py --persona assistant --voice` 端到端语音对话。
+> **本机硬件**：默认输入 = USB Logitech C922 自带麦；默认输出 = Philips SPA3809 USB 音箱（蓝牙音箱已配对但未设默认；如需切换可 `$env:VOICE_OUTPUT_DEVICE='Philips'`）。owner 人脸 + 声纹注册完成。
+> **每轮对话**：打印 `[延迟 录音/STT/LLM/TTS合成/播放/总=Xms]`；Tracer 记录 `llm_call` + `tts_synth` 两个 span；后台每 5 分钟扫描 proactive 事件，最高优先级通过 TTS 播报（与对话轮次互斥）。
 
-### P7 进度
+### 仍待完成（按 vision-completion-plan.md）
 
-| 子阶段 | 状态 |
-|--------|------|
-| P7.1 硬件检测（4 个设备 OK） | ✅ |
-| P7.2 安装 requirements-voice.txt（含 Python 3.14 wheel） | ✅ |
-| P7.3 enroll_owner.py（人脸 5 张 + 声纹 3 段） | ✅ |
-| P7.4 端到端语音对话 | ⏸ 下一 session |
-| P7.5 延迟测量 | ⏸ |
-| P7.6 调优 | ⏸ |
-| P7.7 验收 + 更新文档 | ⏸ |
-
-### P7–P12 一句话目录
-
-| 阶段 | 主题 | 估时 |
-|------|------|------|
-| P7 | 实机端到端验证（蓝牙音箱 + 摄像头 + 麦克风全链路实测，延迟测量） | 1–2 天 |
-| P8 | 主动感知接线（事件分发 + 到家问候 + 后台轮询） | 1 天 |
-| P9 | 情绪感知激活（librosa → EmotionContext → system prompt） | 1–2 天 |
-| P10 | 流式低延迟（真流式 STT/LLM/TTS，目标 < 500ms） | 2–3 天 |
-| P11 | 多人格音色 + 声纹门禁（不同 voice / `speaker_verified` 真激活） | 1–2 天 |
-| P12 | 向量记忆 + 真实评测 + 完整部署（BGE-M3 / 5-LLM 跑分 / Docker / CI 全绿） | 2–3 天 |
-
-### 当前已写代码但未实机验证清单（关键）
-
-| 模块 | 状态 |
+| 阶段 | 主题 |
 |------|------|
-| `backend/streaming/pipeline.py::_transcribe` | 写真，未在真 USB 麦克风音频上跑过 |
-| `backend/tts/__init__.py::play_audio_mp3` | 写真，未在真蓝牙音箱上验证过 |
-| `edge/wakeword.py::listen` | 写真，未在嘈杂环境测试 |
-| `edge/face_gate.py::verify` | 写真，无真实 owner 注册 |
-| `edge/voiceprint.py::verify` | 写真，无真实 owner 注册 |
-| `main.py::_voice_loop` | 全链路未跑通 |
-
-### 仍是真存根/未接线（需 P8–P12 完成）
-
-| 项 | 现状 | 应有 |
-|----|------|------|
-| `edge/emotion.py` | 始终 neutral | librosa 真特征 |
-| 流式 LLM→TTS | 三阶段管道结构存在但 voice loop 是 batched | token-by-token + 句级切块 |
-| `proactive_scan()` 事件消费 | 无人订阅 | voice loop 后台 task 拉队列 → TTS |
-| `face_gate.on_arrival` | 回调签名存在，无人注入 | voice loop 启动时注入 |
-| `speaker_verified` | 硬编码 False | 第一次唤醒时真验证 |
-| 多人格音色 | 全局 `XiaoxiaoNeural` | persona.yaml `voice_name` 字段 |
-| 向量记忆 | 仅 FTS5 | BGE-M3 + 混合检索 |
+| P7.4 | 端到端实机跑通：呼"小安" → STT → LLM → TTS → 蓝牙音箱听到回声 |
+| P7.5 | 延迟测量：累计 10 轮，目标 < 500ms 端到端 |
+| P9 | `edge/emotion.py` librosa 真特征替换 neutral 存根 |
+| P10 | 真流式 STT→LLM→TTS（当前 voice loop 是 batched） |
+| P11 | `speaker_verified` 真激活（face + voiceprint 注册后开放写类工具） |
+| P12 | 向量记忆 BGE-M3 + 混合检索；CI/Docker 实机验证 |
 
 ---
 
-## ⚡ Hand-off Snapshot (2026-04-30 v2 — 历史)
+## ⚡ Hand-off Snapshot (2026-05-10 v4)
+
+> **290 smoke tests 全绿。** 语音循环四个已知问题全部修复。
+> **当前状态**：wake word 使用真实 Whisper logprob 置信度 + no_speech_prob 过滤；蓝牙音箱可通过 `$env:VOICE_OUTPUT_DEVICE='设备名'` 配置；每轮对话打印完整延迟（录音/STT/LLM/TTS合成/播放/总计）；Tracer 记录 `llm_call` + `tts_synth` 两个 span。
+
+## ⚡ Hand-off Snapshot (2026-05-10 v4 — P7.1–P7.3 硬件设置）
+
+> **基础设施层 P1–P6 完成 + P7.1–P7.3 完成。** 281 smoke tests 全绿。语音依赖装好（Python 3.14 wheel 可用），owner 人脸 + 声纹注册完成。
+> **本机硬件状态**：USB Logitech C922 摄像头自带麦（默认输入）、Philips SPA3809 USB 音箱（默认输出）、蓝牙音箱已配对（[25/27]，btha2dp）但未设为默认输出。
+
+## ⚡ Hand-off Snapshot (2026-05-10 v3)
+
+> **290 smoke tests 全绿。** 多音色 + 主动感知消费者已接入语音循环。
+> **当前状态**：`python main.py --voice` 语音循环带每 5 分钟主动感知扫描后台 task；每个 persona 使用独立 edge-tts 音色（persona.yaml `voice` 字段）。
+
+## ⚡ Hand-off Snapshot (2026-04-30 v2)
 
 > **全部完成。所有硬件存根已激活。** 281 smoke tests 全绿。7 个校准探针。
 > **当前状态**：文字对话 + 语音对话均可用。`python main.py --voice` 语音循环可运行（需安装 requirements-voice.txt）。人脸/声纹注册通过 `python scripts/enroll_owner.py`。CI/CD 已就绪（GitHub Actions 运行 Python 3.11/3.12）。
@@ -112,6 +93,9 @@ Living document. Update after each task with new decisions, pitfalls, or changed
 - 测量实际端到端延迟（目标 < 500ms），调整 Whisper 模型大小（tiny vs base）
 - 推到 GitHub 触发 CI，验证 Actions 绿色
 - Docker Compose 实机验证（`docker compose up -d`）
+- speaker_verified 门禁接线（P11）：face + voiceprint 注册后激活写类工具
+- emotion 真实实现（P9）：librosa 能量 + pitch 特征替换存根
+- 向量记忆（P12）：BGE-M3 嵌入接入 store.py hybrid 检索
 
 ### Working tree 状态
 干净。本机 secrets（不入 git）：`backend/secrets/{accounts.env, llm_keys.env, bilibili_credential.json, pyncm_credential.json}` 已在本地填好。
@@ -296,6 +280,52 @@ python main.py --persona assistant --voice
 - `eval/report.md`：已知限制节加 P7–P12 计划链接
 
 **未改代码**。下一步进入 P7.1：蓝牙音箱配对验证。
+
+### 2026-05-10: 语音循环四个预期问题修复（wake word / 蓝牙输出 / 延迟 / Tracer）
+
+**任务**：修复上一 session 总结的四个运行时问题。
+
+**修改文件**：
+- `edge/wakeword.py`：`listen()` 不再 yield 硬编码 0.85，改用 Whisper segment 的 `avg_logprob` 映射到 [0,1] 作为真实置信度；`no_speech_prob > 0.6` 的窗口直接跳过（静默过滤）；只有 `conf >= self.threshold` 才触发唤醒
+- `backend/tts/__init__.py`：新增 `_find_output_device()` — 读取 `VOICE_OUTPUT_DEVICE` 环境变量（数字→设备 ID，字符串→按名称模糊匹配），`_play_with_miniaudio` 将其传给 `sd.play(device=...)`；加入 `__all__` 导出
+- `main.py`：加 `import time`；`_voice_loop` 对每步（录音/STT/LLM/TTS合成/播放）打计时，结尾打印完整延迟行；用 `tracer.span_add/span_end` 记录 `llm_call` + `tts_synth` 两个 span；新增 `_log_output_device()` 在启动时打印实际输出设备名，并提示如何用 env var 切换蓝牙音箱
+
+**使用方法**：
+```powershell
+# 切换到蓝牙音箱（名称模糊匹配，不区分大小写）
+$env:VOICE_OUTPUT_DEVICE = "Philips"
+python main.py --persona assistant --voice
+
+# 验证哪个设备会被使用
+python -c "import sounddevice as sd; [print(i, d['name']) for i, d in enumerate(sd.query_devices())]"
+```
+
+**验证**：290/290 smoke tests 全绿。
+
+### 2026-05-10: 多音色 per persona + 主动感知消费者接入语音循环
+
+**任务**：实现每个 persona 独立 TTS 音色；将主动感知扫描器接入语音循环后台 task。
+
+**新建文件**：
+- `personas/assistant/persona.yaml`：小安人格元数据（name / wake_word / voice: zh-CN-XiaoxiaoNeural）
+
+**修改文件**：
+- `core/persona.py`：`Persona` 加 `voice: str = "zh-CN-XiaoxiaoNeural"` 字段；`load()` 从 `persona.yaml` 读取 voice；`Persona(...)` 构造传入 `voice=voice`
+- `personas/xiaolin/persona.yaml`：新增 `voice: zh-CN-XiaoyiNeural`（晓林用活泼女声）
+- `main.py`：
+  - `_voice_loop` 加 `memory_store` 参数
+  - `EdgeTTSClient(voice=persona.voice)` — 使用 persona 独立音色
+  - `asyncio.Lock` `_turn_lock` 防止主动感知 TTS 与对话轮次重叠
+  - `asyncio.create_task(_proactive_task(...))` 后台任务，`finally` 取消
+  - 新增 `_proactive_task()` 协程：睡眠 interval → 调 proactive_scan → 说最高优先级事件（持有 turn_lock）
+- `tests/smoke_test.py`：新增 `TestPersonaVoice`（5 个）+ `TestProactiveTask`（4 个）
+
+**设计决策**：
+- **turn_lock 覆盖 STT+LLM+TTS 整个轮次**：确保主动 TTS 不会在用户说话或 LLM 思考时插话
+- **每周期只说最高优先级事件**：避免连续多条 TTS 消息堆积（下一个 5 分钟周期自然检测后续事件）
+- **扫描器异常静默忽略**：网络/DB 故障不崩 voice loop
+
+**验证**：290/290 smoke tests 全绿（+9 新增）。
 
 ### 2026-04-30: Post-P6 全量完成——所有存根激活，语音循环就绪
 

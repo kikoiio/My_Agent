@@ -14,6 +14,7 @@ import asyncio
 import argparse
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -149,7 +150,7 @@ def main() -> None:
     print(f"{'='*50}\n")
 
     if args.voice:
-        asyncio.run(_voice_loop(graph, persona, tracer))
+        asyncio.run(_voice_loop(graph, persona, tracer, memory_store))
     else:
         asyncio.run(_chat_loop(graph, persona, tracer))
 
@@ -208,13 +209,13 @@ async def _chat_loop(graph, persona, tracer: Tracer) -> None:
 # Voice loop
 # ---------------------------------------------------------------------------
 
-async def _voice_loop(graph, persona, tracer: Tracer) -> None:
+async def _voice_loop(graph, persona, tracer: Tracer, memory_store: MemoryStore) -> None:
     """Full voice conversation loop: wake word → STT → LLM → TTS → play.
 
+    Also runs proactive scan as a background task every 5 minutes.
     Requires: sounddevice, faster-whisper, edge-tts (+ miniaudio for playback).
     Falls back gracefully when hardware packages are not installed.
     """
-    # Verify voice deps before entering the loop
     _check_voice_deps()
 
     from edge.audio_capture import stream_microphone, capture_until_silence
@@ -223,82 +224,193 @@ async def _voice_loop(graph, persona, tracer: Tracer) -> None:
     from backend.tts.edge_tts_client import EdgeTTSClient
     from backend.streaming.pipeline import _transcribe
 
-    tts_client = EdgeTTSClient()
+    tts_client = EdgeTTSClient(voice=persona.voice)
     wake_word = persona.wake_word or persona.name
     listener = WakeWordListener(persona=wake_word)
+
+    # Lock ensures proactive TTS never overlaps with a conversation turn
+    _turn_lock = asyncio.Lock()
+
+    # Show which audio output device will be used
+    _log_output_device()
 
     print(f"[语音] 正在加载 Whisper 模型（首次启动稍慢）...")
     await listener.load_model()
     print(f"[语音] 就绪。呼唤「{wake_word}」开始对话。Ctrl+C 退出。\n")
+
+    proactive_task = asyncio.create_task(
+        _proactive_task(memory_store, persona.name, tts_client, play_audio_mp3, _turn_lock)
+    )
 
     try:
         async for persona_name, confidence in listener.listen(stream_microphone()):
             print(f"\n[唤醒] {persona_name} (置信度 {confidence:.0%})")
             print("[录音中...] 请说话（停顿 1.5 秒自动结束）")
 
-            try:
-                audio_arr = await capture_until_silence(
-                    silence_threshold=0.015,
-                    silence_duration=1.5,
-                    max_duration=10.0,
-                )
-            except RuntimeError as exc:
-                print(f"[麦克风错误] {exc}")
-                continue
+            async with _turn_lock:
+                t_turn = time.monotonic()
 
-            if audio_arr is None or len(audio_arr) == 0:
-                print("[无声音] 跳过")
-                continue
+                # ── Capture ────────────────────────────────────────────────
+                try:
+                    audio_arr = await capture_until_silence(
+                        silence_threshold=0.015,
+                        silence_duration=1.5,
+                        max_duration=10.0,
+                    )
+                except RuntimeError as exc:
+                    print(f"[麦克风错误] {exc}")
+                    continue
 
-            # STT
-            transcript = await _transcribe(audio_arr)
-            if not transcript.strip():
-                print("[识别为空] 跳过")
-                continue
-            print(f"[识别] {transcript}")
+                if audio_arr is None or len(audio_arr) == 0:
+                    print("[无声音] 跳过")
+                    continue
+                t_capture_ms = int((time.monotonic() - t_turn) * 1000)
 
-            # LLM
-            trace_id = str(uuid.uuid4())[:12]
-            tracer.trace_add(
-                trace_id=trace_id,
-                persona=persona.name,
-                user_id="owner",
-                session_id="owner",
-                role="voice",
-                input_messages_count=1,
-            )
-            try:
-                state = await run_graph(
-                    graph,
-                    input_text=transcript,
+                # ── STT ────────────────────────────────────────────────────
+                t0 = time.monotonic()
+                transcript = await _transcribe(audio_arr)
+                t_stt_ms = int((time.monotonic() - t0) * 1000)
+
+                if not transcript.strip():
+                    print("[识别为空] 跳过")
+                    continue
+                print(f"[识别 {t_stt_ms}ms] {transcript}")
+
+                # ── LLM ────────────────────────────────────────────────────
+                trace_id = str(uuid.uuid4())[:12]
+                tracer.trace_add(
+                    trace_id=trace_id,
                     persona=persona.name,
                     user_id="owner",
-                    trace_id=trace_id,
+                    session_id="owner",
+                    role="voice",
+                    input_messages_count=1,
                 )
-            except Exception as exc:
-                tracer.trace_set_error(trace_id, str(exc))
-                print(f"[LLM 错误] {exc}")
-                continue
-
-            response = state.get("final_response", "")
-            tools_called = state.get("tools_called") or []
-
-            print(f"\n{persona.name}: {response}")
-            if tools_called:
-                print(f"  [tools: {', '.join(tools_called)}]")
-
-            # TTS + 播放
-            if response:
+                span_llm = f"{trace_id}_llm"
+                tracer.span_add(span_llm, trace_id, "llm_call")
+                t0 = time.monotonic()
                 try:
-                    mp3_bytes = await tts_client.synthesize(response)
-                    await play_audio_mp3(mp3_bytes)
+                    state = await run_graph(
+                        graph,
+                        input_text=transcript,
+                        persona=persona.name,
+                        user_id="owner",
+                        trace_id=trace_id,
+                    )
                 except Exception as exc:
-                    print(f"[TTS 错误] {exc}")
+                    t_llm_ms = int((time.monotonic() - t0) * 1000)
+                    tracer.span_end(span_llm, t_llm_ms, error=str(exc))
+                    tracer.trace_set_error(trace_id, str(exc))
+                    print(f"[LLM 错误] {exc}")
+                    continue
+                t_llm_ms = int((time.monotonic() - t0) * 1000)
+                tracer.span_end(span_llm, t_llm_ms)
+
+                response = state.get("final_response", "")
+                tools_called = state.get("tools_called") or []
+
+                print(f"\n{persona.name}: {response}")
+                if tools_called:
+                    print(f"  [tools: {', '.join(tools_called)}]")
+
+                # ── TTS + 播放 ─────────────────────────────────────────────
+                t_tts_synth_ms = 0
+                t_tts_play_ms = 0
+                if response:
+                    span_tts = f"{trace_id}_tts"
+                    tracer.span_add(span_tts, trace_id, "tts_synth")
+                    t0 = time.monotonic()
+                    try:
+                        mp3_bytes = await tts_client.synthesize(response)
+                        t_tts_synth_ms = int((time.monotonic() - t0) * 1000)
+                        tracer.span_end(span_tts, t_tts_synth_ms)
+
+                        t1 = time.monotonic()
+                        await play_audio_mp3(mp3_bytes)
+                        t_tts_play_ms = int((time.monotonic() - t1) * 1000)
+                    except Exception as exc:
+                        t_tts_synth_ms = int((time.monotonic() - t0) * 1000)
+                        tracer.span_end(span_tts, t_tts_synth_ms, error=str(exc))
+                        print(f"[TTS 错误] {exc}")
+
+                t_total_ms = int((time.monotonic() - t_turn) * 1000)
+                print(
+                    f"  [延迟 录音={t_capture_ms}ms "
+                    f"STT={t_stt_ms}ms "
+                    f"LLM={t_llm_ms}ms "
+                    f"TTS合成={t_tts_synth_ms}ms "
+                    f"播放={t_tts_play_ms}ms "
+                    f"总={t_total_ms}ms]"
+                )
 
             print(f"\n[等待唤醒「{wake_word}」...]\n")
 
     except KeyboardInterrupt:
         print("\n再见！")
+    finally:
+        proactive_task.cancel()
+        try:
+            await proactive_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _proactive_task(
+    memory_store: MemoryStore,
+    persona_name: str,
+    tts_client,
+    play_fn,
+    turn_lock: asyncio.Lock,
+    interval: float = 300.0,
+) -> None:
+    """Background task: run proactive scanner every ``interval`` seconds.
+
+    Speaks the highest-priority event if one is found, waiting for any active
+    conversation turn to finish first (via ``turn_lock``).
+    """
+    from backend.proactive.scanner import proactive_scan
+
+    log = logging.getLogger(__name__)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            events = await proactive_scan(memory_store, "owner", persona_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Proactive scan failed: %r", exc)
+            continue
+
+        if not events:
+            continue
+
+        top = events[0]
+        print(f"\n[主动感知] {top.trigger}: {top.message}")
+        async with turn_lock:
+            try:
+                mp3_bytes = await tts_client.synthesize(top.message)
+                await play_fn(mp3_bytes)
+            except Exception as exc:
+                log.warning("Proactive TTS failed: %r", exc)
+
+
+def _log_output_device() -> None:
+    """Print the audio output device that will be used for TTS playback."""
+    try:
+        import sounddevice as sd
+        from backend.tts import _find_output_device
+        dev_id = _find_output_device()
+        if dev_id is None:
+            info = sd.query_devices(kind="output")
+            name = info.get("name", "unknown") if isinstance(info, dict) else str(info)
+            print(f"[音频输出] 使用 OS 默认设备：{name}")
+            print(f"  提示：设置 $env:VOICE_OUTPUT_DEVICE='蓝牙音箱名' 切换输出设备")
+        else:
+            info = sd.query_devices(dev_id)
+            name = info.get("name", str(dev_id)) if isinstance(info, dict) else str(info)
+            print(f"[音频输出] 已选择设备 [{dev_id}]：{name}")
+    except Exception:
+        pass  # sounddevice not installed or query failed — non-fatal
 
 
 def _check_voice_deps() -> None:
