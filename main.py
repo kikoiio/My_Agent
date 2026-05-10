@@ -96,7 +96,15 @@ def main() -> None:
     parser.add_argument("--personas-dir", default="personas", help="Personas root directory")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling")
     parser.add_argument("--voice", action="store_true", help="Enable voice mode (requires hardware)")
+    parser.add_argument("--debug", action="store_true", help="Print every wake-window Whisper transcript")
+    parser.add_argument("--wake-threshold", type=float, default=0.3,
+                        help="Wake word confidence threshold 0–1 (default: 0.3, lower=more sensitive)")
     args = parser.parse_args()
+
+    if args.debug:
+        os.environ["WAKE_DEBUG"] = "1"
+        logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
+        logging.getLogger("edge.wakeword").setLevel(logging.DEBUG)
 
     persona_dir = Path(args.personas_dir) / args.persona
     if not persona_dir.is_dir():
@@ -148,6 +156,9 @@ def main() -> None:
         print(f"  {persona.name} — 文字对话模式")
         print(f"  输入消息开始对话，/quit 退出")
     print(f"{'='*50}\n")
+
+    if args.voice:
+        os.environ.setdefault("WAKE_THRESHOLD", str(args.wake_threshold))
 
     try:
         if args.voice:
@@ -229,7 +240,10 @@ async def _voice_loop(graph, persona, tracer: Tracer, memory_store: MemoryStore)
 
     tts_client = EdgeTTSClient(voice=persona.voice)
     wake_word = persona.wake_word or persona.name
-    listener = WakeWordListener(persona=wake_word)
+    threshold = float(os.environ.get("WAKE_THRESHOLD", "0.3"))
+    listener = WakeWordListener(persona=wake_word, threshold=threshold)
+    if os.environ.get("WAKE_DEBUG") == "1":
+        print(f"[语音] DEBUG 模式：threshold={threshold:.2f}，每个滑窗 transcript 都会打印")
 
     # Lock ensures proactive TTS never overlaps with a conversation turn
     _turn_lock = asyncio.Lock()

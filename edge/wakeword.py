@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -58,11 +59,16 @@ def _keyword_in_text(keyword: str, text: str) -> bool:
     txt = text.lower()
     if kw in txt:
         return True
-    # Common phonetic near-misses for Chinese names transliterated
+    # Common phonetic / homophone near-misses for transliterated Chinese names.
+    # Whisper tiny on short utterances often outputs different homophones.
     _PHONETIC: dict[str, list[str]] = {
-        "小安": ["xiao an", "xiaoann", "小安", "晓安"],
-        "晓林": ["xiao lin", "xiaolin", "晓林", "小林"],
-        "小林": ["xiao lin", "xiaolin", "晓林", "小林"],
+        "小安": [
+            "xiao an", "xiaoan", "xiaoann", "xiao'an",
+            "小安", "晓安", "肖安", "笑安", "孝安", "校安", "宵安", "效安",
+            "小庵", "肖案", "小俺",
+        ],
+        "晓林": ["xiao lin", "xiaolin", "晓林", "小林", "肖林", "校林"],
+        "小林": ["xiao lin", "xiaolin", "晓林", "小林", "肖林"],
         "kobe": ["kobe", "科比", "koby"],
         "assistant": ["assistant", "小安", "助手"],
     }
@@ -152,20 +158,33 @@ class WakeWordListener:
                         )
                     )
                     segs = list(segments)
+                    debug = os.environ.get("WAKE_DEBUG") == "1"
                     if not segs:
+                        if debug:
+                            print("  [wake] (silent window)")
                         continue
                     # Use Whisper's own quality signals:
                     #   avg_logprob ∈ (-inf, 0] → map [-1, 0] → [0, 1] as confidence
                     #   no_speech_prob: skip window if likely silence
                     no_speech_prob = segs[0].no_speech_prob
-                    if no_speech_prob > 0.6:
-                        continue
                     avg_logprob = sum(s.avg_logprob for s in segs) / len(segs)
                     conf = max(0.0, min(1.0, 1.0 + avg_logprob))
                     text = "".join(s.text for s in segs)
+                    matched = _keyword_in_text(self.persona, text)
+
+                    if debug and (text.strip() or matched):
+                        marker = "✓" if (matched and conf >= self.threshold and no_speech_prob <= 0.6) else " "
+                        print(
+                            f"  [wake {marker}] {text!r}  "
+                            f"conf={conf:.2f} no_speech={no_speech_prob:.2f} "
+                            f"thresh={self.threshold:.2f} match={matched}"
+                        )
+
+                    if no_speech_prob > 0.6:
+                        continue
                     if text.strip():
                         logger.debug("Wake window transcript: %r (conf=%.2f)", text, conf)
-                    if conf >= self.threshold and _keyword_in_text(self.persona, text):
+                    if conf >= self.threshold and matched:
                         logger.info("Wake word '%s' detected: %r (conf=%.2f)", self.persona, text, conf)
                         cooldown_chunks = 6  # ~3 seconds cooldown
                         yield (self.persona, conf)
