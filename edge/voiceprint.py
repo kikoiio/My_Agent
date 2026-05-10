@@ -179,26 +179,41 @@ class VoicePrintGate:
 
 
 async def _load_wav(audio_bytes: bytes, sample_rate: int):
-    """Load audio bytes as float32 numpy array, resampled to sample_rate."""
+    """Decode WAV bytes to a float32 numpy array and apply resemblyzer preprocessing.
+
+    resemblyzer's preprocess_wav accepts str/Path/ndarray but NOT BytesIO,
+    so we decode the WAV header ourselves with the stdlib `wave` module
+    and hand off the float32 ndarray.
+    """
     import asyncio
     import numpy as np
+    import wave
 
     def _decode():
         from resemblyzer import preprocess_wav
 
-        # preprocess_wav accepts file-like objects since resemblyzer 0.1.1
-        buf = io.BytesIO(audio_bytes)
-        try:
-            return preprocess_wav(buf, source_sr=sample_rate)
-        except TypeError:
-            # Older resemblyzer versions need a file path — write to temp file
-            import tempfile, os
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                f.write(audio_bytes)
-                tmp = f.name
-            try:
-                return preprocess_wav(tmp)
-            finally:
-                os.unlink(tmp)
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            file_sr = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+
+        # int16 → float32 in [-1, 1].  We assume 16-bit PCM (the format the
+        # enroll script writes).  For other bit-depths, pad to int32 first.
+        if sampwidth == 2:
+            arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sampwidth == 1:
+            arr = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        elif sampwidth == 4:
+            arr = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"Unsupported WAV sample width: {sampwidth}")
+
+        # Stereo → mono
+        if n_channels > 1:
+            arr = arr.reshape(-1, n_channels).mean(axis=1)
+
+        return preprocess_wav(arr, source_sr=file_sr)
 
     return await asyncio.to_thread(_decode)

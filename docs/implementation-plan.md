@@ -1,7 +1,8 @@
 # 实施计划
 
 > 对应设计文档：`plan.md`
-> 当前状态：P0 完成（185 smoke 测试通过，LLM tool calling 端到端验证）
+> 当前状态：**P1–P6 全部完成**（257 smoke 测试通过，开源发布就绪，2026-04-30）
+> 本文件为历史记录；新工作（STT/TTS/声纹硬件接入）参见 `plan.md` §3–4 及 `docs/project-memory.md`。
 
 ---
 

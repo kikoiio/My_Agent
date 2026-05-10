@@ -33,15 +33,16 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Face enrollment
 # --------------------------------------------------------------------------- #
 
-async def enroll_face(owner_id: str = "owner") -> bool:
+async def enroll_face(owner_id: str = "owner", camera_index: int = 0) -> bool:
     """Capture 5 face photos and save the enrollment embedding.
 
-    Opens the default camera (index 0).  Press SPACE to capture each frame.
+    Opens the specified camera (default index 0).  Press SPACE to capture each frame.
+    On Windows we try MSMF first (works reliably with USB webcams), then DSHOW, then ANY.
     """
     try:
         import cv2
     except ImportError:
-        logger.error("opencv-python-headless not installed. Run: pip install opencv-python-headless")
+        logger.error("opencv-python not installed. Run: pip install opencv-python")
         return False
 
     from edge.face_gate import FaceGate
@@ -51,9 +52,19 @@ async def enroll_face(owner_id: str = "owner") -> bool:
         logger.error("Could not load InsightFace models")
         return False
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        logger.error("Could not open camera (index 0)")
+    backends = [("MSMF", cv2.CAP_MSMF), ("DSHOW", cv2.CAP_DSHOW), ("ANY", cv2.CAP_ANY)]
+    cap = None
+    for name, be in backends:
+        c = cv2.VideoCapture(camera_index, be)
+        if c.isOpened():
+            ret, frame = c.read()
+            if ret and frame is not None:
+                cap = c
+                logger.info("Camera %d opened via %s", camera_index, name)
+                break
+        c.release()
+    if cap is None:
+        logger.error("Could not open camera (index %d) on any backend", camera_index)
         return False
 
     print("\n[人脸注册] 请保持光线充足，正对摄像头。")
@@ -176,6 +187,7 @@ async def main() -> bool:
     parser.add_argument("--face-only", action="store_true", help="仅注册人脸")
     parser.add_argument("--voice-only", action="store_true", help="仅注册声纹")
     parser.add_argument("--voice-samples", type=int, default=3, help="声纹录音段数（默认 3）")
+    parser.add_argument("--camera-index", type=int, default=0, help="摄像头索引（0=笔记本内置, 1=USB C922 等）")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -184,7 +196,7 @@ async def main() -> bool:
     success = True
 
     if not args.voice_only:
-        face_ok = await enroll_face(args.owner_id)
+        face_ok = await enroll_face(args.owner_id, camera_index=args.camera_index)
         success = success and face_ok
 
     if not args.face_only:

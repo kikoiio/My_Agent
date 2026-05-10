@@ -38,26 +38,83 @@ _CHUNK_FRAMES = 1_600         # 100 ms at 16 kHz
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _find_input_device() -> tuple[int | None, int]:
-    """Return (device_id, native_sample_rate) for the default input device.
+_HOSTAPI_PRIORITY = (
+    "Windows WDM-KS",   # most reliable for USB webcams (kernel streaming)
+    "Windows WASAPI",   # modern, low-latency
+    "Windows DirectSound",
+    "MME",              # last resort, often -9999 with USB cams
+)
 
-    Always returns device_id=None so that PortAudio uses whatever the OS has
-    configured as the default recording device.  Enumerating a specific device
-    ID is unreliable on Windows when USB adapters shift the device list indices
-    (paInvalidDevice -9996).
 
-    native_sample_rate is read from the default input device info so callers
-    can record at the device's native SR and resample afterwards.
+def _find_input_device() -> tuple[object, int]:
+    """Return (device_spec, native_sample_rate) preferring stable hostapis.
+
+    On Windows the same physical mic appears under MME / DirectSound / WASAPI /
+    WDM-KS hostapis.  Their reliability with USB webcams varies wildly:
+      - MME often -9999 (Unanticipated host error)
+      - DirectSound often -9999
+      - WASAPI often -9996 (Invalid device) or -9997 (Invalid sample rate)
+      - WDM-KS is the kernel-streaming layer and tends to just work
+    So we walk hostapis in our priority order and return the first one whose
+    name matches the OS default input device.  device_spec is an int index
+    (passed to sd.InputStream as `device=int`).
     """
     import sounddevice as sd
 
     try:
-        info = sd.query_devices(kind="input")
-        sr = int(info.get("default_samplerate") or SAMPLE_RATE)
-        logger.debug("Default input device: %s | sr=%d", info.get("name"), sr)
-        return None, sr
+        default_info = sd.query_devices(kind="input")
+        default_name = default_info.get("name", "")
+        default_sr = int(default_info.get("default_samplerate") or SAMPLE_RATE)
+
+        try:
+            hostapis = list(sd.query_hostapis())
+            devices = list(sd.query_devices())
+        except Exception as exc:
+            logger.debug("query failed: %r", exc)
+            return None, default_sr
+
+        for preferred in _HOSTAPI_PRIORITY:
+            ha_idx = next(
+                (i for i, ha in enumerate(hostapis) if ha["name"] == preferred),
+                None,
+            )
+            if ha_idx is None:
+                continue
+            for idx, dev in enumerate(devices):
+                if dev["hostapi"] != ha_idx:
+                    continue
+                if dev["max_input_channels"] <= 0:
+                    continue
+                if dev["name"] == default_name or _name_overlap(dev["name"], default_name):
+                    sr = int(dev.get("default_samplerate") or SAMPLE_RATE)
+                    logger.debug(
+                        "Selected %s input [%d] '%s' | sr=%d",
+                        preferred, idx, dev["name"], sr,
+                    )
+                    return idx, sr
+
+        logger.debug("Falling back to default input '%s' | sr=%d", default_name, default_sr)
+        return None, default_sr
     except Exception:
         return None, SAMPLE_RATE
+
+
+def _name_overlap(a: str, b: str) -> bool:
+    """True if two device-name strings share a meaningful substring.
+
+    sounddevice may rename a device slightly across hostapis (e.g.
+    "麦克风 (C922 Pro Stream Webcam)" on MME vs "C922 Pro Stream Webcam"
+    on WASAPI).  We match on the parenthesised model name.
+    """
+    import re
+    pat = re.compile(r"\(([^)]+)\)")
+    a_match = pat.search(a)
+    b_match = pat.search(b)
+    a_inner = a_match.group(1).strip().lower() if a_match else a.lower()
+    b_inner = b_match.group(1).strip().lower() if b_match else b.lower()
+    if not a_inner or not b_inner:
+        return False
+    return a_inner in b_inner or b_inner in a_inner
 
 
 def _resample(audio: "numpy.ndarray", from_sr: int, to_sr: int) -> "numpy.ndarray":
@@ -80,34 +137,87 @@ def _resample(audio: "numpy.ndarray", from_sr: int, to_sr: int) -> "numpy.ndarra
 def _record_blocking(seconds: float) -> "numpy.ndarray":
     """Blocking audio capture — runs in a thread, returns 16 kHz mono float32.
 
-    Tries stereo then mono to handle devices that don't expose mono in MME.
-    Always resamples to SAMPLE_RATE.
+    Tries multiple (device, channels, sample_rate) combinations to handle
+    Windows MME / WASAPI quirks.  Always resamples to SAMPLE_RATE.
     """
     import sounddevice as sd
     import numpy as np
 
     device_id, native_sr = _find_input_device()
-    frames = int(seconds * native_sr)
+    candidates = _candidate_input_specs(device_id, native_sr)
 
     last_err: Exception | None = None
-    for channels in [2, 1]:
+    for spec in candidates:
+        dev, sr, channels = spec["device"], spec["sr"], spec["channels"]
         try:
+            frames = int(seconds * sr)
             raw = sd.rec(
                 frames,
-                samplerate=native_sr,
+                samplerate=sr,
                 channels=channels,
                 dtype="float32",
-                device=device_id,
+                device=dev,
             )
             sd.wait()
-            # Stereo → mono
             mono = raw.mean(axis=1) if channels == 2 else raw.flatten()
-            return _resample(mono, native_sr, SAMPLE_RATE)
+            logger.debug("Capture OK via device=%r sr=%d channels=%d", dev, sr, channels)
+            return _resample(mono, sr, SAMPLE_RATE)
         except Exception as exc:
             last_err = exc
-            logger.debug("Recording failed with channels=%d: %r", channels, exc)
+            logger.debug(
+                "Recording failed (device=%r sr=%d channels=%d): %r",
+                dev, sr, channels, exc,
+            )
 
     raise RuntimeError(f"Audio recording failed: {last_err}")
+
+
+def _candidate_input_specs(preferred_device, preferred_sr: int) -> list[dict]:
+    """Build a list of (device, sample_rate, channels) combos to try.
+
+    Order: preferred device + preferred sr first, then fallbacks.  Each combo
+    is tried until one works.  This handles cases where a USB webcam advertises
+    one sample rate but only accepts another, or where the device index is
+    wrong but the device name resolves correctly.
+    """
+    import sounddevice as sd
+
+    candidates: list[dict] = []
+    # Always try the preferred (device, sr) first with both channel counts
+    for ch in (1, 2):  # mono first — works on more drivers
+        candidates.append({"device": preferred_device, "sr": preferred_sr, "channels": ch})
+    # Other common sample rates
+    for sr in (16000, 48000, 44100, 32000):
+        if sr == preferred_sr:
+            continue
+        for ch in (1, 2):
+            candidates.append({"device": preferred_device, "sr": sr, "channels": ch})
+    # Fallback: device=None (whatever the OS default is) at every sample rate
+    if preferred_device is not None:
+        for sr in (preferred_sr, 16000, 48000, 44100, 32000):
+            for ch in (1, 2):
+                candidates.append({"device": None, "sr": sr, "channels": ch})
+    # Final fallback: try device by name string of any USB-like input
+    try:
+        names_seen: set[str] = set()
+        for dev in sd.query_devices():
+            if dev["max_input_channels"] <= 0:
+                continue
+            name = dev["name"]
+            # Pull "C922 Pro Stream Webcam" out of "麦克风 (C922 Pro Stream Webcam)"
+            inner = name
+            if "(" in name and ")" in name:
+                inner = name[name.find("(") + 1 : name.rfind(")")]
+            inner = inner.strip()
+            if not inner or inner in names_seen:
+                continue
+            names_seen.add(inner)
+            for sr in (16000, 48000, 44100):
+                for ch in (1, 2):
+                    candidates.append({"device": inner, "sr": sr, "channels": ch})
+    except Exception:
+        pass
+    return candidates
 
 
 # ---------------------------------------------------------------------------

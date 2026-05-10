@@ -12,15 +12,20 @@ Each persona is a **friend** with an independent name (= wake word), voice (Cosy
 
 ## Implementation Status
 
-**All stubs activated. Full voice pipeline complete.**
+**P1–P6 complete (基础设施层).** **P7–P12 进行中（实机验证 + 愿景完成）— 硬件已到位（蓝牙音箱 + USB 网络摄像头自带麦）。**
+详细计划见 [`docs/vision-completion-plan.md`](docs/vision-completion-plan.md)。
 
-- **STT**: `backend/streaming/pipeline.py` — real `faster-whisper` (base model, Chinese). Falls back to placeholder if not installed.
-- **TTS**: `backend/tts/edge_tts_client.py` — free Microsoft Edge TTS (`zh-CN-XiaoxiaoNeural`). CosyVoice chain: self_hosted → dashscope → edge-tts → dummy.
-- **Wake word**: `edge/wakeword.py` — Whisper-based keyword spotting (2s sliding window, no custom model needed).
-- **Face**: `edge/face_gate.py` — InsightFace buffalo_l. Falls back to stub when insightface not installed.
-- **Voiceprint**: `edge/voiceprint.py` — resemblyzer GE2E. Falls back to stub when not installed.
-- **Voice loop**: `python main.py --persona assistant --voice` — full wake→STT→LLM→TTS→play loop.
-- **CI/CD**: `.github/workflows/test.yml` — GitHub Actions runs 281 smoke tests on Python 3.11 + 3.12.
+- **STT**: `backend/streaming/pipeline.py` — real `faster-whisper` (base model, Chinese). 代码已写真，未在真 USB 麦克风上验证（P7）。
+- **TTS**: `backend/tts/edge_tts_client.py` — free Microsoft Edge TTS (`zh-CN-XiaoxiaoNeural`). 代码已写真，未在真蓝牙音箱上验证（P7）。CosyVoice chain: self_hosted → dashscope → edge-tts → dummy.
+- **Wake word**: `edge/wakeword.py` — Whisper-based keyword spotting (2s sliding window). 未在嘈杂环境测试（P7）。
+- **Face**: `edge/face_gate.py` — InsightFace buffalo_l. 代码已写真，无真实 owner 注册（P7）。
+- **Voiceprint**: `edge/voiceprint.py` — resemblyzer GE2E. 代码已写真，无真实 owner 注册（P7）。门禁未激活，`speaker_verified` 仍硬编码 False（P11）。
+- **Emotion**: `edge/emotion.py` — **仍是存根**，始终返回 neutral. P9 替换为 librosa 真特征。
+- **Proactive dispatch**: `backend/proactive/scanner.py` 能产出事件，但**无人消费**. P8 接到 voice loop 后台 task。
+- **Voice loop**: `python main.py --persona assistant --voice` — wake→STT→LLM→TTS→play 链路结构存在，**端到端未实机跑通**（P7）。当前是 batched，非真流式（P10）。
+- **Multi-voice per persona**: 全局 `XiaoxiaoNeural` 一种声音；P11 按 persona 切换 edge-tts voice。
+- **Vector memory**: 仅 FTS5 关键词检索；P12 接入 BGE-M3 + 混合检索。
+- **CI/CD**: `.github/workflows/test.yml` — GitHub Actions runs 281 smoke tests on Python 3.11 + 3.12 (未推 GitHub 验证，P12)。
 
 **Hardware deps**: `pip install -r requirements-voice.txt` (faster-whisper, sounddevice, insightface, resemblyzer, etc.).
 
@@ -116,8 +121,10 @@ docker compose -f deploy/docker-compose.yml up -d
 
 1. **Read this file first** every session
 2. **Then read `docs/project-memory.md`** for decisions, pitfalls, and recent changes
-3. **All stubs activated** — STT (faster-whisper), TTS (edge-tts), wake word (Whisper keyword), face (insightface), voiceprint (resemblyzer). `docs/implementation-plan.md` is historical.
-4. **Do NOT scan the entire repo** — load files only as needed
-5. **Prefer minimal changes** — do not refactor unless asked
-6. **Follow existing style** — match the patterns described above
-7. **After each task, update `docs/project-memory.md`** with new decisions, pitfalls, changed context, smoke test count, and a session log entry
+3. **Then read `docs/vision-completion-plan.md`** if doing P7–P12 work（实机验证 / 主动感知 / 情绪 / 流式 / 多音色 / 向量记忆）
+4. **基础设施代码已写真** — STT/TTS/wake/face/voiceprint 都不是 stub；emotion 仍是存根；speaker_verified / proactive dispatch / 多音色 / 向量记忆 待 P7–P12 接线
+5. **`docs/implementation-plan.md` 是 P1–P6 历史**；新工作走 vision-completion-plan.md
+6. **Do NOT scan the entire repo** — load files only as needed
+7. **Prefer minimal changes** — do not refactor unless asked
+8. **Follow existing style** — match the patterns described above
+9. **After each task, update `docs/project-memory.md`** with new decisions, pitfalls, changed context, smoke test count, and a session log entry
