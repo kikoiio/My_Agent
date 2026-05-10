@@ -25,6 +25,7 @@ __all__ = [
     "SAMPLE_RATE",
     "capture_fixed_duration",
     "capture_until_silence",
+    "read_until_silence",
     "stream_microphone",
 ]
 
@@ -345,6 +346,60 @@ async def capture_until_silence(
     import numpy as np
     combined = np.concatenate(chunks)
     return _resample(combined, native_sr, SAMPLE_RATE)
+
+
+async def read_until_silence(
+    audio_stream,
+    *,
+    silence_threshold: float = 0.015,
+    silence_duration: float = 1.5,
+    max_duration: float = 10.0,
+):
+    """Read int16 PCM chunks from an existing async stream until silence.
+
+    Use this when a microphone stream is already open (e.g. for wake word
+    detection) and you want to capture the user's speech without opening a
+    second InputStream — Windows / WASAPI typically rejects concurrent streams
+    on the same device with PaErrorCode -9996.
+
+    Args:
+        audio_stream: Async generator of int16 PCM bytes at SAMPLE_RATE mono
+            (the same chunk format ``stream_microphone`` yields).
+        silence_threshold: RMS energy (0–1) below which a chunk counts as silent.
+        silence_duration: Seconds of trailing silence needed to stop.
+        max_duration: Hard cap on total recording length.
+
+    Returns:
+        Float32 numpy array of shape (N,) at SAMPLE_RATE.  Empty array if no
+        speech detected before max_duration.
+    """
+    import numpy as np
+
+    chunks: list = []
+    silent_count = 0
+    has_speech = False
+    silence_chunks_needed = max(1, int(silence_duration / 0.1))
+    max_chunks = max(1, int(max_duration / 0.1))
+
+    async for raw_chunk in audio_stream:
+        arr = np.frombuffer(raw_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+        chunks.append(arr)
+
+        rms = float(np.sqrt(np.mean(arr ** 2))) if len(arr) else 0.0
+        if rms > silence_threshold:
+            has_speech = True
+            silent_count = 0
+        elif has_speech:
+            silent_count += 1
+            if silent_count >= silence_chunks_needed:
+                break
+
+        if len(chunks) >= max_chunks:
+            break
+
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(chunks)
 
 
 async def stream_microphone(

@@ -232,7 +232,7 @@ async def _voice_loop(graph, persona, tracer: Tracer, memory_store: MemoryStore)
     """
     _check_voice_deps()
 
-    from edge.audio_capture import stream_microphone, capture_until_silence
+    from edge.audio_capture import stream_microphone, read_until_silence
     from edge.wakeword import WakeWordListener
     from backend.tts import play_audio_mp3
     from backend.tts.edge_tts_client import EdgeTTSClient
@@ -259,17 +259,23 @@ async def _voice_loop(graph, persona, tracer: Tracer, memory_store: MemoryStore)
         _proactive_task(memory_store, persona.name, tts_client, play_audio_mp3, _turn_lock)
     )
 
+    # ONE microphone stream serves both wake detection and post-wake capture.
+    # Opening a second InputStream on the same device fails on Windows
+    # (PaErrorCode -9996), so we read the user's speech from this same stream.
+    mic_stream = stream_microphone()
+
     try:
-        async for persona_name, confidence in listener.listen(stream_microphone()):
+        async for persona_name, confidence in listener.listen(mic_stream):
             print(f"\n[唤醒] {persona_name} (置信度 {confidence:.0%})")
             print("[录音中...] 请说话（停顿 1.5 秒自动结束）")
 
             async with _turn_lock:
                 t_turn = time.monotonic()
 
-                # ── Capture ────────────────────────────────────────────────
+                # ── Capture (reads from the shared mic stream) ─────────────
                 try:
-                    audio_arr = await capture_until_silence(
+                    audio_arr = await read_until_silence(
+                        mic_stream,
                         silence_threshold=0.015,
                         silence_duration=1.5,
                         max_duration=10.0,
