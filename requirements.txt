@@ -13,6 +13,7 @@
 pydantic>=2.5
 PyYAML>=6.0
 python-dotenv>=1.0
+numpy>=1.26          # PCM 字节↔数组转换（streaming/wakeword/voiceprint 测试需要）
 
 # ---- Web 服务 & 通信 ----
 fastapi>=0.109
@@ -44,7 +45,9 @@ miniaudio>=1.2            # MP3/WAV 解码 → PCM 播放
 
 # ---- MCP 服务 ----
 bilibili-api-python>=17.0,<18
-pyncm>=1.6.10
+# pyncm 不在公网 PyPI（仅 GitHub 发布），CI 装不到。运行时若需要网易云音乐工具：
+#   pip install git+https://github.com/greats3an/pyncm.git
+# main.py 已对缺失做容错；smoke tests 用 monkeypatch 模拟 pyncm，不需要真包。
 browser-cookie3>=0.20
 caldav>=1.3
 
